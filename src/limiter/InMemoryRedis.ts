@@ -68,15 +68,23 @@ export class InMemoryRedis implements RedisLike {
     return entry.value;
   }
 
-  async set(key: string, value: string, ...args: (string | number)[]): Promise<'OK'> {
-    // Supports ioredis-style 'PX', ms argument pairs.
+  async set(key: string, value: string, ...args: (string | number)[]): Promise<'OK' | null> {
+    // Supports ioredis-style 'PX', ms and 'NX' flags.
     let expiresAt: number | undefined;
+    let nx = false;
     for (let i = 0; i < args.length; i += 1) {
-      if (String(args[i]).toUpperCase() === 'PX') {
+      const flag = String(args[i]).toUpperCase();
+      if (flag === 'PX') {
         const ms = Number(args[i + 1]);
         if (Number.isFinite(ms)) expiresAt = Date.now() + ms;
         i += 1;
+      } else if (flag === 'NX') {
+        nx = true;
       }
+    }
+    if (nx) {
+      const existing = await this.get(key);
+      if (existing !== null) return null;
     }
     if (this.kv.size >= this.maxKeys && !this.kv.has(key)) {
       const oldest = this.kv.keys().next();

@@ -30,6 +30,9 @@ export const HEADERS = {
   accessControlAllowCredentials: 'access-control-allow-credentials',
   accessControlMaxAge: 'access-control-max-age',
   apiKeyHeader: 'x-api-key',
+  idempotencyKey: 'idempotency-key',
+  idempotentReplay: 'x-idempotent-replay',
+  coalesced: 'x-coalesced',
 } as const;
 
 /** Identity headers always stripped from clients and re-injected when verified. */
@@ -52,6 +55,8 @@ export const STATUS = {
   payloadTooLarge: 413,
   unsupportedMediaType: 415,
   locked: 423,
+  conflict: 409,
+  unprocessableEntity: 422,
 } as const;
 
 export const ERROR_CODES = {
@@ -69,6 +74,8 @@ export const ERROR_CODES = {
   policyDenied: 'POLICY_DENIED',
   apiKeyInvalid: 'API_KEY_INVALID',
   locked: 'LOCKED',
+  idempotencyMismatch: 'IDEMPOTENCY_MISMATCH',
+  conflict: 'CONFLICT',
 } as const;
 
 export const SECURITY_EVENT_TYPES = {
@@ -161,6 +168,19 @@ export const DEFAULTS = {
     jwtLeewaySec: 30,
     jwksCacheTtlMs: 300_000,
     authCacheKeyPrefix: 'gw:auth:',
+  },
+  resilience: {
+    idempotencyTtlMs: 86_400_000, // 24h
+    idempotencyLockTimeoutMs: 30_000,
+    idempotencyMethods: ['POST', 'PATCH', 'DELETE'] as const,
+    idempotencyKeyPrefix: 'gw:idem:',
+    coalesceLeaseMs: 3_000,
+    coalesceWaitMs: 2_800,
+    coalescePollMs: 100,
+    leaseKeyPrefix: 'gw:lease:',
+    l2KeyPrefix: 'gw:l2:',
+    cbKeyPrefix: 'gw:cb:',
+    l2StaleRetentionFactor: 2,
   },
 } as const;
 

@@ -281,6 +281,8 @@ export interface RouteConfig<TReq extends IncomingMessage = IncomingMessage> {
   requiredScopes?: readonly string[];
   /** Allowed Content-Types for non-GET/HEAD requests (415 otherwise). */
   allowedContentTypes?: readonly string[];
+  /** Distributed idempotency for mutating methods carrying Idempotency-Key. */
+  idempotency?: IdempotencyConfig;
 }
 
 export interface GatewayHooks<TReq extends IncomingMessage = IncomingMessage> {
@@ -345,6 +347,17 @@ export interface RedisLike {
   del?(key: string): Promise<unknown>;
 }
 
+/** Per-route distributed idempotency configuration. */
+export interface IdempotencyConfig {
+  enabled: boolean;
+  /** How long COMPLETED responses are replayed. Default 24h. */
+  ttlMs?: number;
+  /** Max time a request may hold the IN_PROGRESS lock / followers wait. Default 30s. */
+  lockTimeoutMs?: number;
+  /** Methods subject to idempotency. Default POST/PATCH/DELETE. */
+  methods?: readonly string[];
+}
+
 export interface RouteCacheConfig {
   /** How long a cached response stays fresh (ms). Required. */
   ttlMs: number;
@@ -354,6 +367,12 @@ export interface RouteCacheConfig {
   serveStaleOnCircuitOpen?: boolean;
   /** Allow caching responses for authenticated requests. Default false. */
   allowAuthenticated?: boolean;
+  /**
+   * Collapse concurrent identical cache-miss GET/HEAD requests onto one
+   * upstream fetch (in-process singleflight + cross-node lease).
+   * Default true when caching is enabled.
+   */
+  coalesce?: boolean;
 }
 
 export interface GatewayProbes {
