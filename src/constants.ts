@@ -5,16 +5,15 @@ export const HEADERS = {
   rateLimitLimit: 'x-ratelimit-limit',
   rateLimitRemaining: 'x-ratelimit-remaining',
   rateLimitReset: 'x-ratelimit-reset',
+  rateLimitSource: 'x-ratelimit-source',
   retryAfter: 'retry-after',
   apiKey: 'x-api-key',
   authorization: 'authorization',
   gatewayCache: 'x-gateway-cache',
   cacheControl: 'cache-control',
   connection: 'connection',
-  userId: 'x-user-id',
-  userRole: 'x-user-role',
   requestId: 'x-request-id',
-  wwwAuthenticate: 'www-authenticate',
+  gatewaySubject: 'x-gateway-subject',
   gatewayTimestamp: 'x-gateway-timestamp',
   gatewaySignature: 'x-gateway-signature',
   contentTypeOptions: 'x-content-type-options',
@@ -34,13 +33,6 @@ export const HEADERS = {
   idempotentReplay: 'x-idempotent-replay',
   coalesced: 'x-coalesced',
 } as const;
-
-/** Identity headers always stripped from clients and re-injected when verified. */
-export const IDENTITY_HEADERS = [
-  'x-user-id',
-  'x-user-role',
-  'x-session-id',
-] as const;
 
 export const STATUS = {
   ok: 200,
@@ -72,17 +64,16 @@ export const ERROR_CODES = {
   payloadTooLarge: 'PAYLOAD_TOO_LARGE',
   unsupportedMediaType: 'UNSUPPORTED_MEDIA_TYPE',
   policyDenied: 'POLICY_DENIED',
-  apiKeyInvalid: 'API_KEY_INVALID',
   locked: 'LOCKED',
   idempotencyMismatch: 'IDEMPOTENCY_MISMATCH',
   conflict: 'CONFLICT',
+  overloaded: 'OVERLOADED',
 } as const;
 
 export const SECURITY_EVENT_TYPES = {
   pathTraversalBlocked: 'PATH_TRAVERSAL_BLOCKED',
   bruteForceLocked: 'BRUTE_FORCE_LOCKED',
   authDenied: 'AUTH_DENIED',
-  apiKeyDenied: 'API_KEY_DENIED',
   policyDenied: 'POLICY_DENIED',
 } as const;
 
@@ -160,14 +151,8 @@ export const DEFAULTS = {
     signatureMaxAgeMs: 60_000,
     signatureHeader: 'x-gateway-signature',
     signatureTimestampHeader: 'x-gateway-timestamp',
-    apiKeyHashPrefix: 'sha256:',
     bruteForceKeyPrefix: 'gw:bf:',
     upstreamFingerprintHeaders: ['x-powered-by', 'server'] as const,
-  },
-  auth: {
-    jwtLeewaySec: 30,
-    jwksCacheTtlMs: 300_000,
-    authCacheKeyPrefix: 'gw:auth:',
   },
   resilience: {
     idempotencyTtlMs: 86_400_000, // 24h
@@ -181,6 +166,18 @@ export const DEFAULTS = {
     l2KeyPrefix: 'gw:l2:',
     cbKeyPrefix: 'gw:cb:',
     l2StaleRetentionFactor: 2,
+  },
+  networking: {
+    eventLoopResolutionMs: 20,
+    maxEventLoopDelayMs: 150,
+    shedRetryAfterSec: 1,
+    upstreamMaxSockets: 256,
+    upstreamMaxFreeSockets: 64,
+    upstreamKeepAliveMsecs: 4_000,
+    serverKeepAliveTimeoutMs: 5_000,
+    serverHeadersTimeoutMs: 60_000,
+    serverRequestTimeoutMs: 300_000,
+    upgradeHandshakeTimeoutMs: 10_000,
   },
 } as const;
 

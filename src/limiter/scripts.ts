@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /**
  * Atomic token-bucket consume script.
  *
@@ -46,3 +48,8 @@ redis.call('PEXPIRE', key, ttlMs)
 
 return { allowed, tokens, capacity, now, retryAfter }
 `;
+
+/** SHA-1 of TOKEN_BUCKET_SCRIPT for EVALSHA pre-loading. */
+export const TOKEN_BUCKET_SHA1 = createHash('sha1')
+  .update(TOKEN_BUCKET_SCRIPT)
+  .digest('hex');

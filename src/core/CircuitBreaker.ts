@@ -1,5 +1,6 @@
 import { CIRCUIT_STATES, DEFAULTS } from '../constants.js';
-import type { CircuitBreakerOptions, CircuitState } from '../types.js';
+import type { CircuitBreakerOptions, CircuitState, GatewayStore } from '../types.js';
+import { storeDel, storeGet, storeSet, storeSetNX } from '../utils/store.js';
 
 interface BreakerState {
   state: CircuitState;
@@ -11,6 +12,10 @@ interface BreakerState {
   windowRequests: number;
   /** Failures observed since last close (ratio window). */
   windowFailures: number;
+}
+
+interface OpenMarker {
+  openedAt: number;
 }
 
 export interface CircuitBreakerLike {
@@ -31,12 +36,18 @@ export interface CircuitBreakerLike {
  * OPEN blocks traffic for openDurationMs, then allows a limited number of
  * probe requests. Probes need `successThreshold` consecutive successes to
  * close; any failure re-opens immediately.
+ *
+ * When a GatewayStore is attached, OPEN transitions are published as
+ * markers so peer nodes respect them immediately, and HALF_OPEN probes
+ * are gated by an atomic NX lease so only one node probes at a time.
  */
 export class CircuitBreaker implements CircuitBreakerLike {
   private readonly states = new Map<string, BreakerState>();
   private readonly defaults: CircuitBreakerOptions;
   private readonly overrides = new Map<string, Partial<CircuitBreakerOptions>>();
   private readonly now: () => number;
+  private store: GatewayStore | undefined;
+  private nodeId = 'local';
 
   constructor(
     defaults: Partial<CircuitBreakerOptions> = {},
@@ -44,6 +55,12 @@ export class CircuitBreaker implements CircuitBreakerLike {
   ) {
     this.defaults = { ...DEFAULTS.circuitBreaker, ...defaults };
     this.now = now;
+  }
+
+  /** Attach a shared store for cross-node OPEN propagation + probe leases. */
+  setDistributedStore(store: GatewayStore, nodeId: string): void {
+    this.store = store;
+    this.nodeId = nodeId;
   }
 
   /** Register per-key option overrides (e.g. per route). */
@@ -76,6 +93,60 @@ export class CircuitBreaker implements CircuitBreakerLike {
     }
   }
 
+  /**
+   * Distributed-aware canExecute: honors OPEN markers published by peer
+   * nodes and serializes HALF_OPEN probes across the fleet via an
+   * atomic NX lease. Falls back to local behavior without a store.
+   */
+  async canExecuteShared(key: string): Promise<boolean> {
+    if (this.store) {
+      const marker = await storeGet(this.store, this.openKey(key));
+      if (marker !== null) {
+        let openedAt = this.now();
+        try {
+          openedAt = (JSON.parse(marker) as OpenMarker).openedAt ?? openedAt;
+        } catch {
+          // malformed marker — treat as freshly opened
+        }
+        const state = this.getOrCreate(key);
+        if (state.state !== CIRCUIT_STATES.open) {
+          state.state = CIRCUIT_STATES.open;
+          state.openedAt = openedAt;
+          state.windowRequests = 0;
+          state.windowFailures = 0;
+        }
+        return false;
+      }
+
+      // Probe lease: only one node may probe a recovering upstream.
+      const local = this.states.get(key);
+      const opts = this.optionsFor(key);
+      const probeCandidate =
+        local !== undefined &&
+        (local.state === CIRCUIT_STATES.halfOpen ||
+          (local.state === CIRCUIT_STATES.open &&
+            this.now() - local.openedAt >= opts.openDurationMs));
+      if (probeCandidate) {
+        const leased = await storeSetNX(
+          this.store,
+          this.probeKey(key),
+          this.nodeId,
+          Math.min(opts.openDurationMs, 30_000),
+        );
+        if (!leased) return false;
+      }
+    }
+    return this.canExecute(key);
+  }
+
+  /** State including peer-published OPEN markers. */
+  async stateOfShared(key: string): Promise<CircuitState> {
+    const local = this.stateOf(key);
+    if (local === CIRCUIT_STATES.open || !this.store) return local;
+    const marker = await storeGet(this.store, this.openKey(key));
+    return marker !== null ? CIRCUIT_STATES.open : local;
+  }
+
   recordSuccess(key: string): void {
     const state = this.getOrCreate(key);
     const opts = this.optionsFor(key);
@@ -89,6 +160,7 @@ export class CircuitBreaker implements CircuitBreakerLike {
         state.consecutiveSuccesses = 0;
         state.windowRequests = 0;
         state.windowFailures = 0;
+        this.releaseDistributed(key);
       }
       return;
     }
@@ -103,7 +175,7 @@ export class CircuitBreaker implements CircuitBreakerLike {
     if (state.state === CIRCUIT_STATES.halfOpen) {
       state.halfOpenInFlight = Math.max(0, state.halfOpenInFlight - 1);
       state.consecutiveFailures = opts.failureThreshold;
-      this.open(state);
+      this.open(key, state, opts.openDurationMs);
       return;
     }
 
@@ -119,19 +191,43 @@ export class CircuitBreaker implements CircuitBreakerLike {
 
     // Ratio mode (when configured) replaces the consecutive-failure check.
     if (ratio !== undefined) {
-      if (ratioTripped) this.open(state);
+      if (ratioTripped) this.open(key, state, opts.openDurationMs);
       return;
     }
     if (state.consecutiveFailures >= opts.failureThreshold) {
-      this.open(state);
+      this.open(key, state, opts.openDurationMs);
     }
   }
 
-  private open(state: BreakerState): void {
+  private open(key: string, state: BreakerState, openDurationMs: number): void {
     state.state = CIRCUIT_STATES.open;
     state.openedAt = this.now();
     state.windowRequests = 0;
     state.windowFailures = 0;
+    if (this.store) {
+      const marker: OpenMarker = { openedAt: state.openedAt };
+      void storeSet(
+        this.store,
+        this.openKey(key),
+        JSON.stringify(marker),
+        openDurationMs,
+      ).catch(() => undefined);
+    }
+  }
+
+  /** Best-effort release of open marker + probe lease after recovery. */
+  private releaseDistributed(key: string): void {
+    if (!this.store) return;
+    void storeDel(this.store, this.openKey(key)).catch(() => undefined);
+    void storeDel(this.store, this.probeKey(key)).catch(() => undefined);
+  }
+
+  private openKey(key: string): string {
+    return `${DEFAULTS.resilience.cbKeyPrefix}open:${key}`;
+  }
+
+  private probeKey(key: string): string {
+    return `${DEFAULTS.resilience.cbKeyPrefix}probe:${key}`;
   }
 
   stateOf(key: string): CircuitState {

@@ -1,21 +1,25 @@
 import { DEFAULTS } from '../constants.js';
 import type { RedisLike } from '../types.js';
+import { BoundedMap } from '../shared/BoundedMap.js';
 
-interface StringEntry {
-  value: string;
-  /** Epoch ms expiry; undefined = no expiry. */
-  expiresAt?: number;
+interface Bucket {
+  tokens: number;
+  ts: number;
 }
 
 /**
  * In-memory RedisLike adapter: implements the token-bucket eval contract
  * plus get/set/del/ping KV ops, so sessions and rate limits work with
  * zero infrastructure. Per-process only — not shared across nodes.
+ * All maps are bounded FIFO stores (DEFAULTS.inMemoryRedis.maxKeys).
  */
 export class InMemoryRedis implements RedisLike {
-  private readonly buckets = new Map<string, { tokens: number; ts: number }>();
-  private readonly kv = new Map<string, StringEntry>();
-  private readonly maxKeys = DEFAULTS.inMemoryRedis.maxKeys;
+  private readonly buckets = new BoundedMap<string, Bucket>({
+    maxEntries: DEFAULTS.inMemoryRedis.maxKeys,
+  });
+  private readonly kv = new BoundedMap<string, string>({
+    maxEntries: DEFAULTS.inMemoryRedis.maxKeys,
+  });
 
   async eval(
     _script: string,
@@ -30,10 +34,6 @@ export class InMemoryRedis implements RedisLike {
     const now = Date.now() / 1000;
     let bucket = this.buckets.get(key);
     if (bucket === undefined) {
-      if (this.buckets.size >= this.maxKeys) {
-        const oldest = this.buckets.keys().next();
-        if (!oldest.done) this.buckets.delete(oldest.value);
-      }
       bucket = { tokens: capacity, ts: now };
       this.buckets.set(key, bucket);
     }
@@ -54,43 +54,39 @@ export class InMemoryRedis implements RedisLike {
     return [allowed, bucket.tokens, capacity, now, retry];
   }
 
+  /** In-memory EVALSHA — script text is irrelevant; semantics match eval. */
+  async evalSha(
+    _sha1: string,
+    numKeys: number,
+    ...args: (string | number)[]
+  ): Promise<unknown> {
+    return this.eval('', numKeys, ...args);
+  }
+
   async ping(): Promise<string> {
     return 'PONG';
   }
 
   async get(key: string): Promise<string | null> {
-    const entry = this.kv.get(key);
-    if (!entry) return null;
-    if (entry.expiresAt !== undefined && entry.expiresAt <= Date.now()) {
-      this.kv.delete(key);
-      return null;
-    }
-    return entry.value;
+    return this.kv.get(key) ?? null;
   }
 
   async set(key: string, value: string, ...args: (string | number)[]): Promise<'OK' | null> {
     // Supports ioredis-style 'PX', ms and 'NX' flags.
-    let expiresAt: number | undefined;
+    let pxMs: number | undefined;
     let nx = false;
     for (let i = 0; i < args.length; i += 1) {
       const flag = String(args[i]).toUpperCase();
       if (flag === 'PX') {
         const ms = Number(args[i + 1]);
-        if (Number.isFinite(ms)) expiresAt = Date.now() + ms;
+        if (Number.isFinite(ms)) pxMs = ms;
         i += 1;
       } else if (flag === 'NX') {
         nx = true;
       }
     }
-    if (nx) {
-      const existing = await this.get(key);
-      if (existing !== null) return null;
-    }
-    if (this.kv.size >= this.maxKeys && !this.kv.has(key)) {
-      const oldest = this.kv.keys().next();
-      if (!oldest.done) this.kv.delete(oldest.value);
-    }
-    this.kv.set(key, expiresAt === undefined ? { value } : { value, expiresAt });
+    if (nx && this.kv.get(key) !== undefined) return null;
+    this.kv.set(key, value, pxMs);
     return 'OK';
   }
 
@@ -99,19 +95,15 @@ export class InMemoryRedis implements RedisLike {
   }
 
   async incr(key: string): Promise<number> {
-    const current = Number(await this.get(key) ?? '0');
+    const current = Number(this.kv.get(key) ?? '0');
     const next = current + 1;
-    // preserve existing TTL if present
-    const entry = this.kv.get(key);
-    const expiresAt = entry?.expiresAt;
-    this.kv.set(key, expiresAt === undefined ? { value: String(next) } : { value: String(next), expiresAt });
+    // Preserve remaining TTL when the key already expires.
+    const ttl = this.kv.ttlRemainingMs(key);
+    this.kv.set(key, String(next), ttl);
     return next;
   }
 
   async expire(key: string, seconds: number): Promise<number> {
-    const entry = this.kv.get(key);
-    if (!entry) return 0;
-    entry.expiresAt = Date.now() + seconds * 1000;
-    return 1;
+    return this.kv.expire(key, seconds * 1000) ? 1 : 0;
   }
 }

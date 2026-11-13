@@ -2,13 +2,13 @@ import type { IncomingMessage } from 'node:http';
 import { HEADERS } from '../constants.js';
 import type { ClientKeyExtractor, RouteConfig } from '../types.js';
 
+import { headerString } from '../shared/httpUtils.js';
+
 export function getHeaderString(
   req: IncomingMessage,
   name: string,
 ): string | undefined {
-  const value = req.headers[name.toLowerCase()];
-  if (value === undefined) return undefined;
-  return Array.isArray(value) ? value[0] : value;
+  return headerString(req.headers, name);
 }
 
 function firstForwardedIp(value: string | undefined): string | undefined {

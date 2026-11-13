@@ -1,287 +1,416 @@
-node -e '
-const fs = require("fs");
-const md = `<div align="center">
+# @udinmoinc/gateway
 
-# \`@udinmoinc/gateway\`
+Zero-runtime-dependency reverse proxy and distributed rate limiter for Node.js. Pluggable edge guards, per-upstream circuit breakers, response caching, perimeter hardening, and adapters for standalone HTTP servers, Express, Fastify, and Web Standard `fetch` — with no built-in authentication or domain model.
 
-**A zero-dependency, high-concurrency API Gateway, Reverse Proxy & Distributed Rate Limiter for Node.js.**
+- **License:** MIT
+- **Node.js:** `>=18.17.0`
+- **Runtime dependencies:** none (Node built-ins + global `fetch` only)
 
-[![npm version](https://img.shields.io/badge/npm-@udinmoinc%2Fgateway-cb3837?style=flat-square&logo=npm)](https://github.com/udinmoInc/gateway)
-[![TypeScript](https://img.shields.io/badge/TypeScript-Strict%20%7C%20Zero%20any-3178c6?style=flat-square&logo=typescript)](https://github.com/udinmoInc/gateway)
-[![Dependencies](https://img.shields.io/badge/dependencies-0%20runtime-2ea44f?style=flat-square)](https://github.com/udinmoInc/gateway)
-[![Tests](https://img.shields.io/badge/tests-60%2B%20passing-2ea44f?style=flat-square&logo=vitest)](https://github.com/udinmoInc/gateway)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+## Table of Contents
 
-*Pure edge infrastructure: routing, pluggable credential verification, atomic Redis rate limiting, circuit breaking, response caching, and perimeter security — standalone or embedded in Express & Fastify.*
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Routing & Configuration Shorthands](#routing--configuration-shorthands)
+- [Rate Limiting & Resilience](#rate-limiting--resilience)
+- [Pluggable Protection & Tags](#pluggable-protection--tags-asprotection)
+- [Perimeter Security & Upstream Signing](#perimeter-security--upstream-signing)
+- [Framework Adapters](#framework-adapters)
+- [Observability, Probes & Shutdown](#observability-probes--shutdown)
+- [Configuration Reference](#configuration-reference)
+- [Error Codes](#error-codes)
 
-</div>
+## Installation
 
----
-
-## Why \`@udinmoinc/gateway\`?
-
-- **Zero Runtime Dependencies** — Built exclusively on native \`node:http\`, \`node:https\`, and \`node:crypto\`. Dual ESM/CJS builds with full \`.d.ts\` declarations (\`tsup\`).
-- **Zero-Copy Streaming Proxy** — Request and response bodies are piped directly via native streams without buffering in memory.
-- **Clock-Safe Distributed Rate Limiting** — Atomic Redis Lua token buckets keyed on Redis \`TIME\` (immune to node clock drift), with an automatic bounded LRU in-memory fallback when Redis is offline or omitted.
-- **Pluggable Edge Authentication** — Ordered \`AuthProvider\` chain supporting \`HS256\` JWTs, \`RS256\`/\`ES256\` JWKS (Supabase, Auth0, Clerk, Keycloak) with automatic \`kid\` rotation refresh, cached introspection, and SHA-256 scoped API keys.
-- **Resilient Upstream Protection** — Per-route \`CLOSED → OPEN → HALF_OPEN\` circuit breakers, weighted round-robin load balancing, LRU response caching with stale-while-open fallback, and graceful connection draining.
-- **Hardened Perimeter Security** — Path-traversal & SSRF metadata guards, anti-spoofing identity header stripping/injection, upstream HMAC request signing, CORS, security headers, and SIEM audit events.
-
----
-
-## Request Lifecycle & Architecture
-
-\`\`\`text
-Incoming Client Request
-  │
-  ├─► 1. Perimeter Guards     (Path Traversal, SSRF, CORS, Body Size, Content-Type, Brute-Force Lockout)
-  ├─► 2. Identity Sanitizer   (Strip inbound X-User-Id / X-User-Role to prevent spoofing)
-  ├─► 3. AuthProvider Chain   (JWKS RS256/ES256 ─► Introspection ─► HS256 JWT ─► API Key ─► RBAC)
-  ├─► 4. Rate Limiter         (Atomic Redis Lua + TIME Token Bucket ──[fallback]──► In-Memory LRU)
-  ├─► 5. Response Cache       (HTTP Cache-Control LRU ──[Circuit OPEN]──► Serve Stale Fallback)
-  ├─► 6. Circuit Breaker      (CLOSED ─► OPEN ─► HALF_OPEN Probe Gating + Weighted Load Balancer)
-  │
-  ▼
-Zero-Copy Stream Proxy ───────► Downstream Microservice (X-User-Id, X-User-Role, X-Request-ID, HMAC Sig)
-\`\`\`
-
----
-
-## 30-Second Quickstart (No Redis Required)
-
-\`\`\`bash
+```bash
 npm install @udinmoinc/gateway
-\`\`\`
+```
 
-\`\`\`ts
-import { startGateway } from "@udinmoinc/gateway";
+Optional peer for distributed rate limiting across processes/nodes:
 
-const gateway = startGateway({
+```bash
+npm install ioredis
+```
+
+`InMemoryRedis` is bundled — single-node deployments need no Redis. Without a `redis` client, limits are per-process.
+
+## Quick Start
+
+### 5-line standalone gateway
+
+```js
+import { startGateway } from '@udinmoinc/gateway';
+
+const gw = startGateway({
   port: 8080,
-  routes: { "/api": "http://localhost:4001" },
-  rateLimit: { requestsPerMinute: 60 },
+  target: 4000,          // → http://localhost:4000, catch-all route
+  rateLimit: '120/min',  // human shorthand
 });
+await gw.listen();       // or gw.listen(3000) to override
+// serving on :8080 → http://localhost:4000
+```
 
-await gateway.listen();
-\`\`\`
+`startGateway` returns a `Gateway` (`listen`, `handleRequest`, `shutdown`, `reloadRoutes`, `listenCluster`, `metrics`, `poolMetrics`).
 
-Requests to \`http://localhost:8080/api/*\` are immediately proxied to \`localhost:4001\` (prefix stripped), rate-limited to \`60 req/min\` with standard \`X-RateLimit-*\` and \`429 Retry-After\` headers, and protected by an automatic error-ratio circuit breaker.
+### CLI
 
-> **Runnable demo:** \`node examples/01-quickstart.mjs\`
+```bash
+npx @udinmoinc/gateway init                        # writes gateway.config.mjs
+npx @udinmoinc/gateway start --port 8080 --target http://localhost:4000 --limit 600/min
+npx @udinmoinc/gateway doctor --config gateway.config.mjs   # validates routes, pings upstreams, SSRF check
+```
 
-<details>
-<summary><strong>View Quickstart Configuration Options</strong></summary>
+`gateway.config.mjs` template:
 
-| Option | Default | Description |
-| :--- | :--- | :--- |
-| \`routes\` | — | Object map \`{ "/api": "http://host" }\` **or** \`SimpleRoute[]\` with \`path\`, \`to\`, \`stripPrefix\`, \`limitPerMinute\` |
-| \`rateLimit.requestsPerMinute\` | \`60\` | Sustained request rate; automatically converted to \`capacity\` and \`refillPerSecond\` |
-| \`rateLimit.burst\` | \`requestsPerMinute\` | Maximum burst token capacity |
-| \`autoCircuitBreaker\` | \`true\` | Trips at \`≥50%\` failure ratio after \`≥10\` upstream calls with a \`15s\` cooldown |
-| \`redis\` | *in-memory* | Optional \`ioredis\`-compatible client for cluster-wide distributed limits |
-| \`port\` / \`host\` / \`upstreamTimeoutMs\` | *engine defaults* | All core \`GatewayConfig\` options are supported |
+```js
+export const routes = {
+  '/api/users': 4001,
+  '/api/orders': ['http://localhost:4002', 'http://localhost:4003'],
+};
+export default { port: 8080, routes };
+```
 
-</details>
+## Routing & Configuration Shorthands
 
----
+Routes are matched by **exact path first (O(1) map lookup), then longest-prefix**. A route `/api` matches `/api` and `/api/*`; `stripPrefix: true` (default) forwards only the remainder to the upstream.
 
-## Production Multi-Node Setup (Redis + Load Balancing)
+### Accepted route shapes
 
-\`\`\`bash
-npm install @udinmoinc/gateway ioredis
-docker compose up -d   # Starts local Redis on :6379
-\`\`\`
+Everything below is valid `GatewayConfig.routes` input — plain strings are validated and branded internally at boot:
 
-\`\`\`ts
-import { Redis } from "ioredis";
-import { startGateway } from "@udinmoinc/gateway";
+```ts
+// 1. Zero-route catch-all
+createGateway({ target: 4000, rateLimit: '120/min' });
 
-const redis = new Redis(process.env.REDIS_URL);
-
-const gateway = startGateway({
-  port: 8080,
-  redis, // Atomic Lua + TIME distributed token bucket
-  routes: [
-    {
-      path: "/api/users",
-      to: [
-        "http://api-a.internal", // Weighted round-robin upstream pool
-        "http://api-b.internal",
-      ],
-      limitPerMinute: 600,
-      stripPrefix: true,
-    },
-    { path: "/api", to: "https://api.internal" },
-  ],
-  rateLimit: { requestsPerMinute: 60, burst: 120 },
-});
-
-await gateway.listen();
-\`\`\`
-
-If Redis becomes unreachable, \`failMode\` governs failover behavior: \`"fallback"\` *(default — bounded in-memory LRU bucket)*, \`"open"\` *(fail-open)*, or \`"closed"\` *(fail-closed)*.
-
----
-
-## Centralized Edge Authentication & Pluggable Providers
-
-Inbound \`X-User-Id\` and \`X-User-Role\` headers are always stripped from client requests and injected upstream **only** after cryptographic verification succeeds.
-
-### 1. Built-in HS256 JWT & RBAC (10 Lines)
-
-\`\`\`ts
-import { createGateway, asRoutePrefix, asUpstreamUrl } from "@udinmoinc/gateway";
-
-const gateway = createGateway({
-  auth: {
-    jwt: { secret: process.env.JWT_SECRET!, issuer: "my-app" },
-  },
-  routes: [
-    { prefix: asRoutePrefix("/admin"),  upstreams: [{ url: asUpstreamUrl("http://admin:4001") }], auth: ["admin"] },
-    { prefix: asRoutePrefix("/api"),    upstreams: [{ url: asUpstreamUrl("http://api:4002") }],   auth: true },
-    { prefix: asRoutePrefix("/public"), upstreams: [{ url: asUpstreamUrl("http://web:4003") }] },
-  ],
-});
-\`\`\`
-
-### 2. Supabase / Auth0 / Clerk / Keycloak — Zero-Dep JWKS (\`RS256\` & \`ES256\`)
-
-\`\`\`ts
-import { createGateway, createJwksProvider, asRoutePrefix, asUpstreamUrl } from "@udinmoinc/gateway";
-
-const gateway = createGateway({
-  auth: {
-    providers: [
-      createJwksProvider({
-        jwksUri: "https://<project>.supabase.co/auth/v1/.well-known/jwks.json",
-        roleClaim: "app_metadata.role",
-        cacheTtlMs: 300_000,
-      }),
-    ],
-  },
-  routes: [
-    { prefix: asRoutePrefix("/api"), upstreams: [{ url: asUpstreamUrl("http://api:4001") }], auth: true },
-  ],
-});
-\`\`\`
-
-### 3. Token Introspection & Custom Provider Chaining
-
-<details>
-<summary><strong>View Introspection & Custom Cookie Provider Examples</strong></summary>
-
-\`\`\`ts
-import { createIntrospectionProvider } from "@udinmoinc/gateway";
-
-createIntrospectionProvider({
-  endpoint: "https://<project>.supabase.co/auth/v1/user",
-  method: "GET",
-  store: redis,
-  cacheTtlMs: 60_000,
-  mapResponse: (body) => {
-    const b = body as { id?: string; app_metadata?: { role?: string } };
-    return b.id ? { userId: b.id, roles: b.app_metadata?.role ? [b.app_metadata.role] : [] } : null;
+// 2. Object map — prefix → upstream(s)
+createGateway({
+  basePrefix: '/api',
+  routes: {
+    '/users': 4001,                                  // port number
+    '/orders': [4002, 4003],                         // port array
+    '/billing': [{ url: 'orders:4004', weight: 3 }], // weighted canary
   },
 });
-\`\`\`
+// serves /api/users/*, /api/orders/*, /api/billing/*
 
-\`\`\`ts
-import { createGateway, createJwtProvider, type AuthProvider } from "@udinmoinc/gateway";
+// 3. route() / group() DSL
+import { route, group } from '@udinmoinc/gateway';
 
-const cookieProvider: AuthProvider = {
-  name: "cookie-session",
-  async authenticate(req) {
-    const sid = readSessionCookie(req);
-    if (!sid) return { skip: true };
-    const user = await mySessionStore.get(sid);
-    return user
-      ? { authenticated: true, identity: { userId: user.id, roles: user.roles } }
-      : { authenticated: false, reason: "Session expired" };
+routes: [
+  route('/users/*', [
+    { url: 4001, weight: 3 },
+    { url: 4002, weight: 1 },
+  ], {
+    rateLimit: '600/min',
+    circuitBreaker: { failureThreshold: 5, openDurationMs: '30s' },
+  }),
+  ...group('/v1', { rateLimit: '300/min' }, [
+    route('/orders', 4003, { stripPrefix: false }),
+  ]),
+]
+
+// 4. routesDir — drop .js/.cjs/.mjs route modules in a directory
+createGateway({ routesDir: './routes' });
+
+// 5. autoRoutes — env-var discovery
+createGateway({
+  basePrefix: '/svc',
+  autoRoutes: { envPrefix: 'GATEWAY_' },
+  // GATEWAY_USERS=4001        → /svc/users  → http://localhost:4001
+  // GATEWAY_ORDER_ITEMS=orders:4002 → /svc/order-items
+});
+```
+
+### Upstream target expansion
+
+| Input | Resolves to |
+|---|---|
+| `4001`, `':4001'` | `http://localhost:4001` |
+| `'users:4001'`, `'10.0.0.5:8080'` | `http://users:4001`, `http://10.0.0.5:8080` |
+| `'http://…'`, `'https://…'` | unchanged |
+| `{ url, weight }` | weighted upstream (default weight 1) |
+
+Multiple upstreams per route are balanced with **P2C** (power of two choices) by default; `upstreamStrategy: 'weighted-rr'` selects weighted round-robin.
+
+### Live reload
+
+```ts
+gateway.reloadRoutes({ '/new': 4005 });                    // RoutesInput
+gateway.reloadRoutes({ target: 4006, rateLimit: '60/min' }); // full options form
+gateway.reloadRoutes(routesArrayFromFileWatcher);
+```
+
+`basePrefix` and probe/metrics routes are preserved; an empty result throws. Boot fails fast when `routes`, `target`, `routesDir`, and `autoRoutes` all produce zero routes (unless a health/metrics path is configured).
+
+## Rate Limiting & Resilience
+
+### Distributed token bucket
+
+With `limiter.redis` (ioredis-compatible `eval`/`evalsha`), each request runs a Lua script against Redis `TIME` for clock-skew-free token buckets, cached via `EVALSHA` with `NOSCRIPT` fallback to `EVAL`. `InMemoryRedis` implements the same contract in-process.
+
+```ts
+createGateway({
+  limiter: {
+    redis,                    // ioredis client or InMemoryRedis
+    failMode: 'fallback',     // 'fallback' | 'open' | 'closed'
+    keyPrefix: 'gw:rl',
+    commandTimeoutMs: 500,
+    localMaxKeys: 10_000,
+  },
+});
+```
+
+`failMode`: `fallback` degrades to a bounded in-memory limiter, `open` allows all traffic, `closed` rejects with 429/503. Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `X-RateLimit-Source` (`redis` | `local` | `local-fallback` | `fail-open` | `fail-closed` | `batch`), and denials include `Retry-After`.
+
+Rate-limit rules are `{ capacity, refillPerSecond, batchSize? }` — `batchSize` leases up to N tokens per Redis round-trip (clamped to `capacity`, default 1). Input forms: `{ capacity, refillPerSecond, batchSize? }`, `'600/min'`, `'100/sec'`, `'2/hour'`. Client key defaults to `extractClientIp`; override globally (`extractClientKey`) or per route. Built-ins: `extractClientIp`, `extractApiKeyOrIp`, `createCompositeExtractor`.
+
+### Circuit breakers
+
+Per route+upstream state machine `CLOSED → OPEN → HALF_OPEN`. OPEN rejects fast (503) for `openDurationMs`, then admits probe requests; `successThreshold` consecutive successes close it, one failure re-opens. Distributed deployments share OPEN markers and HALF_OPEN probe leases through `GatewayStore`.
+
+```ts
+route('/api', 4001, {
+  circuitBreaker: {
+    failureThreshold: 5,
+    successThreshold: 2,
+    openDurationMs: '30s',   // duration shorthand
+    failureRatioThreshold: 0.5,
+    minimumRequests: 10,
+    probeTimeoutMs: 5_000,
+  },
+})
+```
+
+### Request resilience
+
+- **Coalescing** — concurrent identical cache-miss GET/HEAD requests collapse onto one upstream fetch (`cache.coalesce`, default on when caching is enabled).
+- **Idempotency** — `idempotency: { enabled: true }` replays stored responses for mutating requests carrying `Idempotency-Key`.
+- **Hedging** — `hedging: { enabled: true, delayMs: 150 }` fires a duplicate upstream attempt for slow idempotent requests (GET/HEAD or requests with `Idempotency-Key`).
+- **Upgrades** — `Upgrade: websocket` requests are tunneled raw to the upstream (SSE included); `upgradeHandshakeTimeoutMs` bounds the handshake.
+- **Load shedding** — `loadShedding: { enabled: true, maxConcurrentRequests, maxEventLoopDelayMs }` returns 503 `OVERLOADED` under pressure.
+- **Timeouts** — `upstreamTimeoutMs` per request; pending sockets are destroyed on abort.
+
+## Pluggable Protection & Tags (`asProtection`)
+
+The gateway ships **no authentication, sessions, users, roles, or tenants**. Domain logic enters through `EdgeGuard`s and `ProtectionProvider`s you write.
+
+### ProtectionProvider — the friendly contract
+
+```ts
+import { asProtection, route, requireTag, anyOf } from '@udinmoinc/gateway';
+import type { ProtectionProvider } from '@udinmoinc/gateway';
+
+const tenantGuard: ProtectionProvider = {
+  name: 'tenant',
+  async verify(ctx) {
+    const session = await lookupSession(ctx.req.headers.cookie);
+    if (!session) {
+      return { allow: false, status: 401, code: 'UNAUTHORIZED', message: 'login required' };
+    }
+    return {
+      allow: true,
+      tags: { tenant: session.tenantId, plan: session.plan },   // → ctx.tags
+      headers: { 'x-tenant-id': session.tenantId },             // → upstream headers
+    };
   },
 };
 
-const gateway = createGateway({
-  auth: {
-    providers: [cookieProvider, createJwtProvider({ secret: process.env.JWT_SECRET! })],
+const protected = asProtection(tenantGuard); // curried wrapper
+
+routes: [
+  protected(route('/api/admin/*', 4001)),
+  // or two-arg form: asProtection(tenantGuard, route(...))
+]
+```
+
+### Composing guards
+
+```ts
+import { composeGuards, anyOf, allOf, requireTag, requireHeader } from '@udinmoinc/gateway';
+
+route('/api/billing', 4001, {
+  guards: [
+    // sequential — all must allow; tags/headers merge downstream
+    composeGuards(
+      requireTag('plan', (p) => p === 'pro' || p === 'enterprise'),
+      requireTag('tenant'),
+      requireHeader('x-requested-with', 'XMLHttpRequest'),
+    ),
+    // first allow wins
+    anyOf(
+      requireTag('role', 'admin'),
+      requireTag('role', 'billing'),
+    ),
+  ],
+})
+```
+
+`requireTag(key, expected?, { status, code, message })` — `expected` is a string, list, or predicate; default deny is 403 `FORBIDDEN`. `requireHeader(name, expected?)` — missing → 401, mismatch → 403.
+
+Guards receive `EdgeRequestContext` (`req`, `res`, `route`, `clientKey`, `tags`, `headers`, `upstreamPath`) and return `{ action: 'allow', headers?, tags? }` or `{ action: 'deny', status, code, message, headers? }`. Global guards run via `GatewayConfig.guards`; per-route via `RouteConfig.guards`.
+
+### Header anti-spoofing
+
+```ts
+createGateway({
+  stripHeaders: ['x-tenant-id', 'x-user-id', 'x-plan'],
+  routes: [{ prefix: '/api', upstreams: 4001, stripHeaders: ['x-internal'] }],
+})
+```
+
+Client-sent copies are removed before proxying; guard-emitted `headers` are then injected, so upstreams only trust gateway-attested values.
+
+## Perimeter Security & Upstream Signing
+
+Applied before routing/proxying:
+
+| Control | Config | Behavior |
+|---|---|---|
+| Path traversal | always on | Rejects `..`, multi-encoded `%252e%252e`, null bytes, backslashes — 400 |
+| Body limit | `maxBodyBytes` (default 1 MiB) | 413 `PAYLOAD_TOO_LARGE` |
+| MIME allowlist | per-route `allowedContentTypes` | 415 `UNSUPPORTED_MEDIA_TYPE` on non-GET/HEAD |
+| Brute-force lockout | `bruteForce: { maxFailures, windowSec, lockDurationSec }` | 423 `LOCKED` per client IP on guard denials |
+| CORS | `cors: { origins, methods?, headers?, credentials?, maxAgeSec? }` | Preflight handled; `'*'` + `credentials` rejected at boot |
+| Security headers | `securityHeaders: { frameOptions?, hsts? }` | `X-Frame-Options` (default `DENY`), optional HSTS |
+| Error masking | `maskUpstreamErrors: true` | Upstream 5xx bodies replaced with sanitized JSON |
+| SSRF guard | always on | Blocks link-local/metadata upstreams unless `allowMetadataUpstreams: true` |
+| Audit | `onSecurityEvent` | Structured `SecurityAuditEvent`s for SIEM sinks |
+
+### HMAC-SHA256 upstream signing
+
+```ts
+createGateway({
+  upstreamSigning: {
+    secret: process.env.GATEWAY_SIGNING_SECRET!,
+    subjectTag: 'tenant',        // signs ctx.tags.tenant as the subject
+    subjectHeader: 'x-gateway-subject',
+    headerName: 'x-gateway-signature',
+    timestampHeader: 'x-gateway-timestamp',
   },
-  routes: [],
 });
-\`\`\`
+```
 
-</details>
+Every proxied request carries `X-Gateway-Signature`, `X-Gateway-Timestamp`, and (when `subjectTag` is set) `X-Gateway-Subject`. The signature covers timestamp + method + path + subject + request ID. Downstream verifies with:
 
----
+```ts
+import { verifyGatewaySignature } from '@udinmoinc/gateway';
 
-## Framework Adapters (Express & Fastify)
+const ok = verifyGatewaySignature(req.headers, req.method, req.url, SECRET, 300_000);
+// headers, method, path, secret, maxAgeMs?, { headerName?, timestampHeader?, subjectHeader? }
+```
 
-<table>
-<tr>
-<th width="50%">Express</th>
-<th width="50%">Fastify</th>
-</tr>
-<tr>
-<td>
+`signGatewayRequest()` is exported for non-HTTP callers; `resolveSigningConfig()` normalizes partial configs.
 
-\`\`\`ts
-import express from "express";
-import { gatewayMiddleware } from "@udinmoinc/gateway/express";
+## Framework Adapters
+
+All adapters accept the same `GatewayConfig` (routes optional when `target`/`routesDir`/`autoRoutes` is set) and share `handleRequest`.
+
+### Standalone
+
+```ts
+import { createGateway } from '@udinmoinc/gateway';
+
+const gw = createGateway({ routes: { '/api': 4001 } });
+await gw.listen(8080);
+await gw.shutdown();                 // drains connections, closes limiter timers
+await gw.listenCluster();            // node:cluster multi-core supervisor
+```
+
+### Express — `@udinmoinc/gateway/express`
+
+```ts
+import express from 'express';
+import { gatewayMiddleware } from '@udinmoinc/gateway/express';
 
 const app = express();
-app.use(gatewayMiddleware({ routes: [] }));
-app.get("/health", (_req, res) => res.json({ ok: true }));
-app.listen(3000);
-\`\`\`
+app.use(gatewayMiddleware({
+  basePrefix: '/api',
+  routes: { '/users': [{ url: 4001, weight: 3 }, { url: 4002, weight: 1 }] },
+}));
+app.get('/health', (_req, res) => res.json({ ok: true })); // unmatched → next()
+app.listen(8080);
+```
 
-</td>
-<td>
+### Fastify — `@udinmoinc/gateway/fastify`
 
-\`\`\`ts
-import Fastify from "fastify";
-import { registerGateway } from "@udinmoinc/gateway/fastify";
+```ts
+import Fastify from 'fastify';
+import { registerGateway } from '@udinmoinc/gateway/fastify';
 
 const app = Fastify();
-registerGateway(app, { routes: [] });
-await app.listen({ port: 3000 });
-\`\`\`
+registerGateway(app, { target: 4000 });
+app.get('/health', async () => ({ ok: true })); // unmatched → fastify route
+await app.listen({ port: 8080 });
+```
 
-</td>
-</tr>
-</table>
+`reply.hijack()` is invoked before raw response streaming — no `FST_ERR_REP_ALREADY_SENT`.
 
----
+### Fetch / Next.js / Bun — `@udinmoinc/gateway/fetch`
 
-## Standardized Error Responses
+```ts
+import { createFetchGateway } from '@udinmoinc/gateway/fetch';
 
-| Status | Error Code | Trigger Condition |
-| :---: | :--- | :--- |
-| \`401\` | \`UNAUTHORIZED\` | Missing, malformed, invalid, or expired JWT / API key / session |
-| \`403\` | \`FORBIDDEN\` | Valid credential, but identity lacks required route role or scope |
-| \`404\` | \`NO_ROUTE\` | Request path did not match any configured route prefix |
-| \`413\` | \`PAYLOAD_TOO_LARGE\` | Inbound request body exceeds \`maxBodyBytes\` |
-| \`415\` | \`UNSUPPORTED_MEDIA_TYPE\` | \`Content-Type\` header is not in \`allowedContentTypes\` |
-| \`423\` | \`LOCKED\` | Per-IP brute-force lockout active (\`Retry-After\` header included) |
-| \`429\` | \`RATE_LIMITED\` | Token bucket exhausted (\`X-RateLimit-*\` & \`Retry-After\` included) |
-| \`502\` | \`UPSTREAM_ERROR\` | Upstream connection refused, reset, or protocol error |
-| \`503\` | \`CIRCUIT_OPEN\` / \`DRAINING\` | Route circuit breaker is \`OPEN\` or gateway is shutting down |
-| \`504\` | \`UPSTREAM_ERROR\` | Upstream exceeded \`upstreamTimeoutMs\` |
+const gw = createFetchGateway({ routes: { '/api': 4001 } });
 
----
+// Next.js App Router
+export async function GET(req: Request) {
+  return gw(req); // Request → Response, in-process, no socket
+}
+```
 
-## Local Development & Benchmarks
+Bodies (`ReadableStream`/`ArrayBuffer`), binary responses, and unmatched-route 404s are handled.
 
-\`\`\`bash
-npm install
-docker compose up -d   # Optional local Redis (tests run standalone without it)
-npm run build          # Dual ESM/CJS + .d.ts build via tsup
-npm run typecheck      # Strict tsc --noEmit verification
-npm test               # Full unit + live-socket integration suite (60+ tests)
-k6 run benchmarks/load-test.js -e GATEWAY_URL=http://localhost:8080
-\`\`\`
+## Observability, Probes & Shutdown
 
-## License
+- **Request IDs** — `X-Request-ID` is honored/generated; spoofed inbound IDs are replaced unless trusted. Propagated upstream and into audit events.
+- **Health** — `healthPath: '/healthz'` → 200/503. `probes: { livenessPath, readinessPath, readinessTimeoutMs }` → liveness always 200, readiness pings Redis + circuits.
+- **Metrics** — `metricsPath: '/gateway/metrics'` serves Prometheus text (`Accept: text/plain`) or JSON (`Accept: application/json`) through the normal route pipeline (guard/rate-limit it like any route).
+- **Hooks** — `hooks: { onRequest, onAuthorized, onUpstreamResponse, onUpstreamError, onRateLimited, onCircuitOpen, onProxyError }` plus lifecycle `plugins` (`GatewayPlugin.onRequest`/`onResponse`) and `onSecurityEvent`.
+- **Shutdown** — `gateway.shutdown()` stops accepting, drains in-flight requests, closes caches/limiters, and resolves. SIGINT/SIGTERM handlers are wired by `listen()`/`startGateway`.
 
-MIT © [Vijay Singh](https://github.com/udinmoInc)
-`;
-fs.writeFileSync("README.md", md);
-console.log("README.md written cleanly!");
-' && git add README.md && git commit -m "docs: format README with badges, architecture diagram, and collapsible guides" && git push
+## Configuration Reference
+
+`GatewayConfig` (all optional except one of `routes`/`target`/`routesDir`/`autoRoutes`):
+
+| Field | Type | Default |
+|---|---|---|
+| `routes` | `RoutesInput` — array, `route()`/`group()` output, or `{ '/path': target }` map | — |
+| `target` | `UpstreamInput` | catch-all when `routes` omitted |
+| `basePrefix` | `string` (`'/api'`) | none |
+| `autoRoutes` | `{ envPrefix?, env? }` | `GATEWAY_` prefix, `process.env` |
+| `rateLimit` / `circuitBreaker` / `cache` | top-level defaults for `target` route | — |
+| `limiter` | `RateLimiterOptions` | in-memory |
+| `port` / `host` | `number` / `string` | `0` / `'0.0.0.0'` (via `listen`) |
+| `upstreamTimeoutMs` | `number` | per `DEFAULTS` |
+| `extractClientKey` | `ClientKeyExtractor` | client IP |
+| `guards` / `stripHeaders` | `EdgeGuard[]` / `string[]` | — |
+| `upstreamSigning` | `UpstreamSigningConfig` | off |
+| `bruteForce` | `BruteForceConfig` | off |
+| `cors` | `CorsConfig` | off |
+| `securityHeaders` | `SecurityHeadersConfig` | off |
+| `maskUpstreamErrors` | `boolean` | off |
+| `maxBodyBytes` | `number` | 1 MiB |
+| `allowedContentTypes` | per-route `string[]` | all |
+| `healthPath` / `metricsPath` / `probes` | paths | off |
+| `loadShedding` | `LoadSheddingConfig` | off |
+| `routesDir` | `string` | — |
+| `plugins` / `hooks` / `onSecurityEvent` | lifecycle | — |
+| `allowMetadataUpstreams` | `boolean` | false (SSRF on) |
+
+Per-route `RouteConfig` adds: `rateLimit`, `circuitBreaker`, `stripPrefix`, `cache`, `guards`, `stripHeaders`, `allowedContentTypes`, `idempotency`, `hedging`, `upstreamStrategy`, `extractClientKey`.
+
+## Error Codes
+
+| Status | Code | Cause |
+|---|---|---|
+| 400 | `BAD_REQUEST` | malformed request / path traversal |
+| 401 | `UNAUTHORIZED` | guard denial (missing credentials/header) |
+| 403 | `FORBIDDEN` | guard denial (tag/role mismatch) |
+| 404 | `NOT_FOUND` | no route matched |
+| 408 | `UPSTREAM_TIMEOUT` | upstream exceeded `upstreamTimeoutMs` |
+| 413 | `PAYLOAD_TOO_LARGE` | body over `maxBodyBytes` |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | Content-Type not in `allowedContentTypes` |
+| 423 | `LOCKED` | brute-force lockout active |
+| 429 | `RATE_LIMITED` | token bucket exhausted |
+| 500 | `UPSTREAM_ERROR` | upstream connection failure |
+| 502 | `BAD_GATEWAY` | upstream returned invalid response |
+| 503 | `SERVICE_UNAVAILABLE` / `OVERLOADED` / `CIRCUIT_OPEN` | circuit open, shed load, or upstream down |

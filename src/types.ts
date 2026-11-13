@@ -22,87 +22,86 @@ export type FailMode = (typeof FAIL_MODES)[keyof typeof FAIL_MODES];
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 export type CacheStatus = (typeof CACHE_STATUS)[keyof typeof CACHE_STATUS];
 
-/** `true` = any valid credential; array = required roles (RBAC). */
-export type RouteAuth = boolean | readonly string[];
+// ---------- edge guard contract (auth-agnostic core) ----------
 
-export interface JwtAuthConfig {
-  /** HS256 signing/verification secret (required for Bearer tokens). */
-  secret: string;
-  /** Optional `iss` claim requirement. */
-  issuer?: string;
-  /** Optional `aud` claim requirement (string or list). */
-  audience?: string | readonly string[];
-  /** Clock-skew tolerance in seconds for exp/nbf. Default DEFAULTS.auth.jwtLeewaySec. */
-  clockToleranceSec?: number;
-}
-
-export interface AuthConfig<TReq extends IncomingMessage = IncomingMessage> {
-  /** Stateless Bearer JWT (HS256) verification at the edge. */
-  jwt?: JwtAuthConfig;
+/** Read-only context handed to every EdgeGuard. */
+export interface EdgeRequestContext<TReq extends IncomingMessage = IncomingMessage> {
+  req: TReq;
+  method: string;
+  /** Request path (no query). */
+  path: string;
+  /** Raw req.url including query. */
+  url: string | undefined;
+  /** Resolved route prefix, when inside a route. */
+  routePrefix?: string;
+  /** Rate-limit client key. */
+  clientKey: string;
+  clientIp?: string;
   /**
-   * Pluggable auth providers evaluated in order after `jwt`.
-   * First `{ authenticated: true }` wins; `{ authenticated: false }`
-   * rejects immediately; `{ skip: true }` falls through.
+   * Generic domain tags emitted by previously-allowed guards in this
+   * pipeline (immutable bag — guards read, never write). Keys/values
+   * are whatever the developer's guards produce: plan, tenant,
+   * region, feature flags, etc.
    */
-  providers?: readonly AuthProvider<TReq>[];
-  /** Value for the WWW-Authenticate realm on 401 responses. */
-  realm?: string;
-  /** Additional client headers always stripped before proxying. */
-  stripHeaders?: readonly string[];
+  tags: Readonly<Record<string, string>>;
+  /**
+   * Headers emitted by previously-allowed guards in this pipeline
+   * (lowercased) — trusted values injected upstream.
+   */
+  headers: Record<string, string>;
 }
 
-/** Result of an AuthProvider.authenticate call. */
-export type AuthOutcome =
-  | { readonly authenticated: true; readonly identity: VerifiedIdentity }
-  | { readonly authenticated: false; readonly reason?: string }
-  | { readonly skip: true };
+export type EdgeGuardDecision =
+  | {
+      action: 'allow';
+      /** Trusted headers to inject upstream. */
+      headers?: Record<string, string>;
+      /** Domain tags attached to the request context (merged). */
+      tags?: Readonly<Record<string, string>>;
+    }
+  | {
+      action: 'deny';
+      status: number;
+      code: string;
+      message: string;
+      headers?: Record<string, string>;
+    };
 
 /**
- * Pluggable authentication strategy — JWT, JWKS, introspection,
- * cookie sessions, mTLS, or any custom logic.
+ * Stateless edge guard — the ONLY extension point for request
+ * interception in core. Implementations live in userland; the engine
+ * never imports domain logic.
  */
-export interface AuthProvider<TReq extends IncomingMessage = IncomingMessage> {
-  readonly name: string;
-  authenticate(req: TReq): Promise<AuthOutcome>;
+export interface EdgeGuard<TReq extends IncomingMessage = IncomingMessage> {
+  readonly name?: string;
+  evaluate(ctx: EdgeRequestContext<TReq>): Promise<EdgeGuardDecision> | EdgeGuardDecision;
 }
 
-export interface JwksProviderOptions {
-  /** JWKS endpoint URL (e.g. Supabase /auth/v1/.well-known/jwks.json). */
-  jwksUri: string;
-  issuer?: string;
-  audience?: string | readonly string[];
-  /** In-memory key cache TTL. Default 300_000 (5 min). */
-  cacheTtlMs?: number;
-  clockToleranceSec?: number;
-  /** Claim path for roles — dot-notation supported ('app_metadata.role'). */
-  roleClaim?: string;
-  /** Claim path for user id. Default 'sub'. */
-  userIdClaim?: string;
-}
-
-export interface IntrospectionProviderOptions {
-  /** External auth/introspection endpoint (e.g. Supabase /auth/v1/user). */
-  endpoint: string;
-  method?: 'GET' | 'POST';
-  /** Extra headers forwarded to the endpoint. */
-  headers?: Readonly<Record<string, string>>;
-  /**
-   * Extract the credential to forward. Default returns the full
-   * `Bearer <token>` Authorization header value.
-   */
-  extractCredential?: (req: IncomingMessage) => string | null;
-  /** Map the endpoint's JSON response to a VerifiedIdentity (null = reject). */
-  mapResponse: (body: unknown) => VerifiedIdentity | null;
-  /** Positive-result cache TTL in ms. */
-  cacheTtlMs?: number;
-  /** Optional GatewayStore for distributed outcome caching. */
-  store?: GatewayStore;
-}
-
-/** Verified caller identity attached to the request context. */
-export interface VerifiedIdentity {
-  userId: string;
-  roles: readonly string[];
+/**
+ * Developer-friendly protection contract — implement `verify()` with
+ * any domain logic (sessions, tenants, feature flags, quotas, mTLS)
+ * and attach it via `asProtection()`.
+ */
+export interface ProtectionProvider<TReq extends IncomingMessage = IncomingMessage> {
+  readonly name?: string;
+  verify(
+    ctx: EdgeRequestContext<TReq>,
+  ): Promise<
+    | {
+        readonly allow: true;
+        /** Arbitrary domain tags attached to request context. */
+        readonly tags?: Readonly<Record<string, string>>;
+        /** Trusted headers injected into the upstream request. */
+        readonly headers?: Readonly<Record<string, string>>;
+      }
+    | {
+        readonly allow: false;
+        readonly status?: number;
+        readonly code?: string;
+        readonly message?: string;
+        readonly headers?: Readonly<Record<string, string>>;
+      }
+  >;
 }
 
 // ---------- pluggable interfaces ----------
@@ -115,23 +114,6 @@ export interface VerifiedIdentity {
 export interface GatewayStore extends RedisLike {
   incr?(key: string): Promise<number>;
   expire?(key: string, seconds: number): Promise<unknown>;
-}
-
-export interface ApiKeyRecord {
-  id: string;
-  /** SHA-256 hex digest of the raw API key (never the key itself). */
-  keyHash: string;
-  tenantId: string;
-  scopes: readonly string[];
-  /** Epoch ms after which the key is rejected. */
-  expiresAtMs?: number;
-  /** Per-key rate limit override applied instead of the route rule. */
-  rateLimitOverride?: RateLimitRule;
-}
-
-/** Async lookup of API keys by SHA-256 hash. */
-export interface ApiKeyProvider {
-  resolveByHash(keyHash: string): Promise<ApiKeyRecord | null>;
 }
 
 /** Result of a plugin's onRequest policy check. */
@@ -172,16 +154,20 @@ export interface SecurityAuditEvent {
 
 export interface UpstreamSigningConfig {
   secret: string;
+  /**
+   * Tag key whose value is signed as the request "subject" (e.g.
+   * 'tenant', 'subject'). Default: no subject is signed.
+   */
+  subjectTag?: string;
+  /**
+   * Header carrying the subject upstream so verifiers can rebuild
+   * the signed payload. Default 'x-gateway-subject'.
+   */
+  subjectHeader?: string;
   /** Signature header name. Default 'x-gateway-signature'. */
   headerName?: string;
   /** Timestamp header name. Default 'x-gateway-timestamp'. */
   timestampHeader?: string;
-}
-
-export interface ApiKeyGuardConfig {
-  provider: ApiKeyProvider;
-  /** Header carrying the raw key. Default 'x-api-key'. */
-  headerName?: string;
 }
 
 export interface BruteForceConfig {
@@ -213,7 +199,22 @@ export interface RateLimitRule {
   capacity: number;
   /** Tokens refilled per second. */
   refillPerSecond: number;
+  /**
+   * Lease up to N tokens per Redis round-trip; intermediate requests
+   * are served from a bounded local credit window. Clamped to
+   * `capacity`. Default 1 (one token per call).
+   */
+  batchSize?: number;
 }
+
+/** Which backend produced a rate-limit decision. */
+export type RateLimitSource =
+  | 'redis'
+  | 'local'
+  | 'local-fallback'
+  | 'fail-open'
+  | 'fail-closed'
+  | 'batch';
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -225,6 +226,8 @@ export interface RateLimitResult {
   resetAt: number;
   /** Milliseconds until the caller may retry (0 when allowed). */
   retryAfterMs: number;
+  /** Backend that produced this decision (X-RateLimit-Source). */
+  source?: RateLimitSource;
 }
 
 export type ClientKeyExtractor<TReq extends IncomingMessage = IncomingMessage> = (
@@ -273,16 +276,119 @@ export interface RouteConfig<TReq extends IncomingMessage = IncomingMessage> {
   /** Optional bounded in-memory GET/HEAD response cache. */
   cache?: RouteCacheConfig;
   /**
-   * Centralized auth: `false`/undefined = public, `true` = any valid
-   * session or JWT, `string[]` = required roles (RBAC).
+   * Per-route edge guards evaluated after global `config.guards`.
+   * First deny wins; allow-headers are merged and injected upstream.
    */
-  auth?: RouteAuth;
-  /** Scopes a valid API key must hold (requires `apiKeys.provider`). */
-  requiredScopes?: readonly string[];
+  guards?: readonly EdgeGuard<TReq>[];
+  /** Additional client headers stripped before proxying (merged with global stripHeaders). */
+  stripHeaders?: readonly string[];
   /** Allowed Content-Types for non-GET/HEAD requests (415 otherwise). */
   allowedContentTypes?: readonly string[];
   /** Distributed idempotency for mutating methods carrying Idempotency-Key. */
   idempotency?: IdempotencyConfig;
+  /** Upstream selection strategy. Default 'p2c' when multiple upstreams. */
+  upstreamStrategy?: 'weighted-rr' | 'p2c';
+  /** Speculative hedged requests for idempotent GET/HEAD traffic. */
+  hedging?: HedgingConfig;
+}
+
+// ---------- ergonomic route inputs (plain strings & shorthands) ----------
+// These widen the strict RouteConfig shape so users never need branded-type
+// casts: prefixes/URLs may be plain strings (validated at boot), `to` is an
+// alias for `upstreams`, rateLimit accepts '600/min', and circuitBreaker
+// openDurationMs accepts '30s'.
+
+export type DurationString =
+  | `${number}ms`
+  | `${number}s`
+  | `${number}m`
+  | `${number}h`
+  | `${number}d`;
+export type RateLimitString = `${number}/sec` | `${number}/min` | `${number}/hour`;
+export type RateLimitInput = RateLimitRule | RateLimitString;
+export type CacheInput = number | DurationString | RouteCacheConfig;
+
+/** A single upstream: URL string, port number, ':port', 'host:port', or { url, weight }. */
+export type UpstreamTargetInput =
+  | string
+  | number
+  | { readonly url: string | number; readonly weight?: number };
+/** One upstream or a list of them (weighted canaries supported). */
+export type UpstreamInput =
+  | UpstreamTargetInput
+  | readonly UpstreamTargetInput[];
+
+/** Circuit-breaker override accepting duration shorthands. */
+export interface CircuitBreakerInput
+  extends Omit<Partial<CircuitBreakerOptions>, 'openDurationMs'> {
+  openDurationMs?: number | DurationString;
+}
+
+/** RouteConfig fields shared by every shorthand form. */
+export interface RouteShorthandFields<
+  TReq extends IncomingMessage = IncomingMessage,
+> extends Omit<
+    RouteConfig<TReq>,
+    'prefix' | 'upstreams' | 'rateLimit' | 'circuitBreaker' | 'cache'
+  > {
+  rateLimit?: RateLimitInput;
+  circuitBreaker?: CircuitBreakerInput;
+  cache?: CacheInput;
+}
+
+/** `{ prefix, upstreams|to, ... }` form — plain strings allowed. */
+export interface MappedRouteConfig<
+  TReq extends IncomingMessage = IncomingMessage,
+> extends RouteShorthandFields<TReq> {
+  prefix: `/${string}`;
+  upstreams?: UpstreamInput;
+  /** Alias for `upstreams`. */
+  to?: UpstreamInput;
+}
+
+/** `{ path, to, ... }` DSL-definition form (route()/group() output shape). */
+export interface PathRouteConfig<
+  TReq extends IncomingMessage = IncomingMessage,
+> extends RouteShorthandFields<TReq> {
+  path: `/${string}` | `${string}/*`;
+  to: UpstreamInput;
+}
+
+export type RouteInput<TReq extends IncomingMessage = IncomingMessage> =
+  | RouteConfig<TReq>
+  | MappedRouteConfig<TReq>
+  | PathRouteConfig<TReq>;
+
+/** Plain object map `{ '/api': 'http://host' }`. */
+export type RouteMapInput = Readonly<Record<`/${string}`, UpstreamInput>>;
+
+/** Everything `routes` accepts: built configs, shorthands, or a route map. */
+export type RoutesInput<TReq extends IncomingMessage = IncomingMessage> =
+  | readonly RouteInput<TReq>[]
+  | RouteMapInput;
+
+/** Env-var auto-discovery for routes (`GATEWAY_USERS=4001` → `/users`). */
+export interface AutoRoutesConfig {
+  /** Env var prefix to scan. Default 'GATEWAY_'. */
+  envPrefix?: string;
+  /** Env source — defaults to `process.env` (injectable for tests). */
+  env?: Readonly<Record<string, string | undefined>>;
+}
+
+/**
+ * Options accepted by `gateway.reloadRoutes()` — same shape as the
+ * route-related subset of GatewayConfig, so target/basePrefix/autoRoutes
+ * and global defaults behave identically on hot reload.
+ */
+export interface RouteReloadConfig<
+  TReq extends IncomingMessage = IncomingMessage,
+> {
+  routes?: RoutesInput<TReq>;
+  target?: UpstreamInput;
+  rateLimit?: RateLimitInput;
+  circuitBreaker?: CircuitBreakerInput;
+  cache?: CacheInput;
+  autoRoutes?: AutoRoutesConfig;
 }
 
 export interface GatewayHooks<TReq extends IncomingMessage = IncomingMessage> {
@@ -300,6 +406,18 @@ export interface GatewayHooks<TReq extends IncomingMessage = IncomingMessage> {
     ctx: RequestContext<TReq>,
     error: Error,
   ): void | Promise<void>;
+  /** Called when a request is rejected with 429 (rate limited). */
+  onRateLimited?(
+    ctx: RequestContext<TReq>,
+    result: RateLimitResult,
+  ): void | Promise<void>;
+  /** Called when a request is rejected because the upstream circuit is OPEN. */
+  onCircuitOpen?(ctx: RequestContext<TReq>): void | Promise<void>;
+  /** Called on proxy-level errors (alias alongside onUpstreamError). */
+  onProxyError?(
+    ctx: RequestContext<TReq>,
+    error: Error,
+  ): void | Promise<void>;
 }
 
 export interface RequestContext<TReq extends IncomingMessage = IncomingMessage> {
@@ -311,8 +429,11 @@ export interface RequestContext<TReq extends IncomingMessage = IncomingMessage> 
   upstream: UpstreamTarget;
   /** Client key used for rate limiting. */
   clientKey: string;
-  /** Verified caller identity (present only for authenticated requests). */
-  identity?: VerifiedIdentity;
+  /**
+   * Generic domain tags emitted by edge guards (plan, tenant, region…).
+   * Read-only for plugins/hooks.
+   */
+  tags: Readonly<Record<string, string>>;
   /** Path with the route prefix stripped (what the upstream sees). */
   upstreamPath: string;
   /** Full upstream URL for this request. */
@@ -338,6 +459,15 @@ export interface RedisLike {
     numKeys: number,
     ...args: (string | number)[]
   ): Promise<unknown>;
+  /**
+   * Optional EVALSHA fast path — the limiter prefers this when present
+   * and falls back to `eval` on NOSCRIPT.
+   */
+  evalSha?(
+    sha1: string,
+    numKeys: number,
+    ...args: (string | number)[]
+  ): Promise<unknown>;
   defineCommand?(name: string, options: { numberOfKeys: number }): unknown;
   /** Optional lightweight liveness probe (ioredis exposes `ping`). */
   ping?(): Promise<unknown>;
@@ -345,6 +475,32 @@ export interface RedisLike {
   get?(key: string): Promise<string | null>;
   set?(key: string, value: string, ...args: (string | number)[]): Promise<unknown>;
   del?(key: string): Promise<unknown>;
+}
+
+/** Speculative request hedging for idempotent GET/HEAD routes. */
+export interface HedgingConfig {
+  enabled: boolean;
+  /** Delay before firing a hedge request (ms). */
+  delayMs: number;
+  /** Max additional upstream attempts. Default 1. */
+  maxHedges?: number;
+}
+
+/** Event-loop / concurrency load shedding configuration. */
+export interface LoadSheddingConfig {
+  enabled: boolean;
+  /** p99 event-loop delay threshold (ms). Default 150. */
+  maxEventLoopDelayMs?: number;
+  /** In-flight request ceiling. Default unlimited. */
+  maxConcurrentRequests?: number;
+}
+
+/** Live per-upstream connection pool metrics. */
+export interface UpstreamPoolMetrics {
+  activeSockets: number;
+  freeSockets: number;
+  queuedRequests: number;
+  inFlight: number;
 }
 
 /** Per-route distributed idempotency configuration. */
@@ -365,8 +521,23 @@ export interface RouteCacheConfig {
   maxEntries?: number;
   /** Serve expired cache when the route's circuit breaker is OPEN. */
   serveStaleOnCircuitOpen?: boolean;
-  /** Allow caching responses for authenticated requests. Default false. */
-  allowAuthenticated?: boolean;
+  /**
+   * Allow caching responses for requests carrying guard-emitted
+   * tags/headers. Default false — contextual responses are never
+   * cached unless the route opts in.
+   */
+  allowContextual?: boolean;
+  /**
+   * Cache-key variation on guard-emitted tags (e.g. ['tenant','plan']).
+   * Values are read from `ctx.tags`; missing keys contribute nothing.
+   */
+  varyTags?: readonly string[];
+  /**
+   * Cache-key variation on inbound request headers (e.g.
+   * ['accept-language','x-tenant-id']). Values are read from
+   * `req.headers`.
+   */
+  varyHeaders?: readonly string[];
   /**
    * Collapse concurrent identical cache-miss GET/HEAD requests onto one
    * upstream fetch (in-process singleflight + cross-node lease).
@@ -377,9 +548,9 @@ export interface RouteCacheConfig {
 
 export interface GatewayProbes {
   /** Exact path answered with liveness 200, bypassing limits/routes. */
-  livenessPath?: RoutePrefix;
+  livenessPath?: `/${string}`;
   /** Exact path answered with readiness (checks Redis + circuits). */
-  readinessPath?: RoutePrefix;
+  readinessPath?: `/${string}`;
   /** Redis PING timeout for readiness. Default DEFAULTS.probes.readinessTimeoutMs (500). */
   readinessTimeoutMs?: number;
 }
@@ -404,14 +575,32 @@ export interface GatewayServerOptions<TReq extends IncomingMessage = IncomingMes
   extractClientKey?: ClientKeyExtractor;
   /** Per-request upstream timeout. */
   upstreamTimeoutMs?: number;
-  /** Max sockets per upstream agent. */
+  /** Upgrade/WebSocket handshake timeout (ms). Default DEFAULTS.networking.upgradeHandshakeTimeoutMs. */
+  upgradeHandshakeTimeoutMs?: number;
+  /**
+   * Serve gateway metrics (Prometheus text or JSON via Accept header)
+   * when the request path equals this value. The endpoint flows through
+   * the normal route pipeline — define a matching route (optionally
+   * wrapped in asProtection) to guard/rate-limit it.
+   */
+  metricsPath?: `/${string}`;
+  /** Max sockets per upstream agent (alias of maxSocketsPerUpstream). */
   maxSockets?: number;
+  /** Max sockets per upstream origin agent. Default DEFAULTS.proxy.maxSockets (256). */
+  maxSocketsPerUpstream?: number;
   /** Global hooks applied to every route. */
   hooks?: GatewayHooks<TReq>;
   /** Optional /healthz-style liveness and /readyz-style readiness probes. */
   probes?: GatewayProbes;
-  /** Centralized auth/session configuration. */
-  auth?: AuthConfig<TReq>;
+  /**
+   * Global edge guards — the request-interception extension point.
+   * Guards are stateless, composable, and supplied by the developer
+   * (or `asProtection` wrappers). First deny wins; allow-headers and
+   * allow-tags merge into the request context.
+   */
+  guards?: readonly EdgeGuard<TReq>[];
+  /** Client headers always stripped before proxying (anti-spoofing). */
+  stripHeaders?: readonly string[];
   /**
    * Directory containing route definition modules (*.js/*.cjs loaded
    * synchronously; use `loadRoutesDir` for *.ts/*.mjs).
@@ -419,9 +608,7 @@ export interface GatewayServerOptions<TReq extends IncomingMessage = IncomingMes
   routesDir?: string;
   /** HMAC-sign every proxied request for downstream verification. */
   upstreamSigning?: UpstreamSigningConfig;
-  /** Scoped API key authentication via SHA-256 hash lookup. */
-  apiKeys?: ApiKeyGuardConfig;
-  /** Per-IP brute-force lockout on auth failures. */
+  /** Per-IP brute-force lockout on guard denials. */
   bruteForce?: BruteForceConfig;
   /** CORS policy; `'*'` + credentials is rejected at boot. */
   cors?: CorsConfig;
@@ -432,7 +619,7 @@ export interface GatewayServerOptions<TReq extends IncomingMessage = IncomingMes
   /** Allow upstreams pointing at link-local/metadata IPs (SSRF guard opt-out). */
   allowMetadataUpstreams?: boolean;
   /** Exact path for a lightweight health probe (200/503). */
-  healthPath?: RoutePrefix;
+  healthPath?: `/${string}`;
   /** Lifecycle plugins (policy interceptors, metrics). */
   plugins?: readonly GatewayPlugin<TReq>[];
   /** Max request body bytes. Default DEFAULTS.perimeter.maxBodyBytes (1 MiB). */
@@ -443,9 +630,30 @@ export interface GatewayServerOptions<TReq extends IncomingMessage = IncomingMes
 
 export interface GatewayConfig<TReq extends IncomingMessage = IncomingMessage>
   extends GatewayServerOptions<TReq> {
-  /** Route table. May be omitted when `routesDir` is provided. */
-  routes?: readonly RouteConfig<TReq>[];
+  /**
+   * Route table. Accepts built `route()`/`group()`/`defineRoute()` configs,
+   * plain-string shorthands, or an object map `{ '/api': 'http://host' }`.
+   * May be omitted when `routesDir` or `target` is provided.
+   */
+  routes?: RoutesInput<TReq>;
+  /**
+   * Zero-route shorthand: when `routes` is omitted, compiles a catch-all
+   * `'/'` route to this target with the top-level defaults below.
+   */
+  target?: UpstreamInput;
+  /** Rate limit applied to the `target` catch-all route. */
+  rateLimit?: RateLimitInput;
+  /** Circuit-breaker override applied to the `target` catch-all route. */
+  circuitBreaker?: CircuitBreakerInput;
+  /** Cache config applied to the `target` catch-all route. */
+  cache?: CacheInput;
+  /** Prepended to every route prefix (e.g. '/api' → '/api/users'). */
+  basePrefix?: string;
+  /** Auto-register routes from env vars (`GATEWAY_USERS=4001` → `/users`). */
+  autoRoutes?: AutoRoutesConfig;
   limiter?: RateLimiterOptions;
+  /** Event-loop / concurrency load shedding (503 OVERLOADED). */
+  loadShedding?: LoadSheddingConfig;
 }
 
 export interface DefineRouteOptions<TReq extends IncomingMessage = IncomingMessage>

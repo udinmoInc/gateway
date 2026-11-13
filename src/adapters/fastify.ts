@@ -1,12 +1,10 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { createGateway } from '../core/GatewayEngine.js';
 import type { Gateway } from '../core/GatewayEngine.js';
 import type { GatewayConfig, RouteConfig } from '../types.js';
+import { createAdapterGateway, routeMatches } from './adapterCore.js';
+import type { AdapterGatewayConfig } from './adapterCore.js';
 
-export interface FastifyGatewayOptions
-  extends Omit<GatewayConfig, 'routes'> {
-  routes: readonly RouteConfig[];
-}
+export type FastifyGatewayOptions = AdapterGatewayConfig;
 
 /**
  * Fastify adapter using the onRequest lifecycle + reply.hijack().
@@ -21,11 +19,10 @@ export function registerGateway(
   fastify: FastifyInstance,
   config: FastifyGatewayOptions,
 ): Gateway {
-  const gateway = createGateway(config);
+  const gateway = createAdapterGateway(config);
 
   fastify.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
-    const matched = gateway.router.resolve(request.raw) !== undefined;
-    if (!matched) return; // let other routes/plugins handle it
+    if (!routeMatches(gateway, request.raw)) return; // let other routes/plugins handle it
 
     reply.hijack();
     await gateway.handleRequest(request.raw, reply.raw);
@@ -38,5 +35,5 @@ export function registerGateway(
   return gateway;
 }
 
-export { createGateway };
+export { createGateway } from '../core/GatewayEngine.js';
 export type { Gateway, GatewayConfig, RouteConfig };

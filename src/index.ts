@@ -3,6 +3,8 @@ import { createGateway } from './core/GatewayEngine.js';
 import type { Gateway, ShutdownOptions } from './core/GatewayEngine.js';
 import { CircuitBreaker } from './core/CircuitBreaker.js';
 import type { CircuitBreakerLike } from './core/CircuitBreaker.js';
+import { MetricsCollector } from './core/MetricsCollector.js';
+import type { MetricOutcome } from './core/MetricsCollector.js';
 import { RedisRateLimiter } from './limiter/RedisRateLimiter.js';
 import { LocalFallback } from './limiter/LocalFallback.js';
 import { Router } from './core/Router.js';
@@ -12,20 +14,14 @@ import {
   extractClientIp,
   createCompositeExtractor,
   resolveExtractor,
-  getHeaderString,
+  getHeaderString,  
 } from './utils/extractors.js';
 import { sendJson, sendGatewayResponse, defaultErrorBody } from './utils/http.js';
+import { normalizeRoute } from './routing/normalize.js';
 import type {
-  ApiKeyGuardConfig,
-  ApiKeyProvider,
-  ApiKeyRecord,
-  AuthConfig,
-  AuthOutcome,
-  AuthProvider,
   Brand,
-  IntrospectionProviderOptions,
-  JwksProviderOptions,
   BruteForceConfig,
+  CircuitBreakerInput,
   CircuitBreakerOptions,
   CorsConfig,
   GatewayPlugin,
@@ -39,38 +35,55 @@ import type {
   CircuitState,
   ClientKeyExtractor,
   DefineRouteOptions,
+  EdgeGuard,
+  EdgeGuardDecision,
+  EdgeRequestContext,
   ErrorCode,
+  ProtectionProvider,
   FailMode,
   GatewayConfig,
   GatewayHooks,
   GatewayProbes,
   GatewayResponse,
-  JwtAuthConfig,
+  HedgingConfig,
+  IdempotencyConfig,
+  LoadSheddingConfig,
+  MappedRouteConfig,
+  PathRouteConfig,
   RateLimitResult,
   RateLimitRule,
+  RateLimitSource,
   RateLimiterOptions,
   RedisLike,
   RequestContext,
-  RouteAuth,
   RouteCacheConfig,
   RouteConfig,
+  RouteInput,
+  RouteMapInput,
   RoutePrefix,
+  RouteReloadConfig,
+  RoutesInput,
+  UpstreamPoolMetrics,
   UpstreamResponseInfo,
   UpstreamTarget,
+  UpstreamTargetInput,
   UpstreamUrl,
-  VerifiedIdentity,
 } from './types.js';
 import { CIRCUIT_STATES, CACHE_STATUS, DEFAULTS, ERROR_CODES, FAIL_MODES, HEADERS, SECURITY_EVENT_TYPES, STATUS } from './constants.js';
-import { ResponseCache } from './cache/ResponseCache.js';
+export { ResponseCache } from './cache/ResponseCache.js';
 export type { CacheEntry, CacheLookup } from './cache/ResponseCache.js';
+export { RequestCoalescer } from './cache/RequestCoalescer.js';
+export { IdempotencyManager } from './resilience/IdempotencyManager.js';
+export type { IdempotencyBegin, IdempotentResult } from './resilience/IdempotencyManager.js';
+export { LoadShedder } from './networking/LoadShedder.js';
+export { LoadBalancer } from './routing/LoadBalancer.js';
+export { listenCluster } from './networking/ClusterSupervisor.js';
+export type { ClusterGateway, ClusterOptions } from './networking/ClusterSupervisor.js';
+export { proxyUpgrade } from './networking/UpgradeProxy.js';
 export { InMemoryRedis } from './limiter/InMemoryRedis.js';
-export { signJwt, verifyJwt } from './auth/jwt.js';
-export type { JwtClaims, JwtVerifyOptions } from './auth/jwt.js';
-export {
-  createIntrospectionProvider,
-  createJwksProvider,
-  createJwtProvider,
-} from './auth/providers.js';
+export { allOf, anyOf, composeGuards, requireHeader, requireTag } from './core/guards.js';
+export { asProtection, providerToGuard } from './routing.js';
+export type { ProtectionApplier, ProtectionSource } from './routing.js';
 export { route, group, parseRateLimit, parseDurationMs, normalizePrefix } from './routing/dsl.js';
 export type {
   CacheInput,
@@ -85,8 +98,6 @@ export type {
 export { loadRoutesDir, loadRoutesDirSync } from './routing/RouteLoader.js';
 export { signGatewayRequest, verifyGatewaySignature, resolveSigningConfig } from './security/UpstreamSigner.js';
 export type { SignInput, SignResult, VerifyOptions } from './security/UpstreamSigner.js';
-export { ApiKeyGuard, hashApiKey } from './security/ApiKeyGuard.js';
-export type { ApiKeyAuthResult } from './security/ApiKeyGuard.js';
 export { BruteForceGuard } from './security/BruteForceGuard.js';
 export {
   allowedOriginValue,
@@ -103,11 +114,15 @@ export {
 export { startGateway } from './easy.js';
 export type { QuickGatewayOptions, SimpleRateLimit, SimpleRoute, SimpleRouteMap, SimpleUpstream } from './easy.js';
 
-/** Identity helper — validates route shape at compile time. */
+/**
+ * Route builder — accepts every shorthand shape (plain-string prefix,
+ * `to` alias, '600/min' rate limits, weighted upstream objects) and
+ * returns a normalized RouteConfig. No brand casts needed.
+ */
 export function defineRoute<TReq extends IncomingMessage = IncomingMessage>(
-  route: DefineRouteOptions<TReq>,
+  route: RouteInput<TReq>,
 ): RouteConfig<TReq> {
-  return route as RouteConfig<TReq>;
+  return normalizeRoute<TReq>(route);
 }
 
 /** Identity helper — validates gateway config at compile time. */
@@ -117,16 +132,13 @@ export function defineGatewayConfig<TReq extends IncomingMessage = IncomingMessa
   return config;
 }
 
-/** Branded-type constructors for literal-safe route/URL values. */
-export const asRoutePrefix = (prefix: `/${string}`): RoutePrefix =>
-  prefix as RoutePrefix;
-export const asUpstreamUrl = (
-  url: `http://${string}` | `https://${string}`,
-): UpstreamUrl => url as UpstreamUrl;
+/** Branded-type constructors — runtime-validated (shared single source). */
+export { asRoutePrefix, asUpstreamUrl } from './shared/httpUtils.js';
 
 export {
   createGateway,
   CircuitBreaker,
+  MetricsCollector,
   RedisRateLimiter,
   LocalFallback,
   Router,
@@ -150,15 +162,7 @@ export {
 };
 
 export type {
-  ApiKeyGuardConfig,
-  ApiKeyProvider,
-  ApiKeyRecord,
-  AuthConfig,
-  AuthOutcome,
-  AuthProvider,
   Brand,
-  IntrospectionProviderOptions,
-  JwksProviderOptions,
   BruteForceConfig,
   CircuitBreakerLike,
   CorsConfig,
@@ -170,30 +174,45 @@ export type {
   SecurityEventType,
   SecurityHeadersConfig,
   UpstreamSigningConfig,
+  CircuitBreakerInput,
   CircuitBreakerOptions,
   CircuitState,
   ClientKeyExtractor,
   DefineRouteOptions,
+  EdgeGuard,
+  EdgeGuardDecision,
+  EdgeRequestContext,
   ErrorCode,
+  ProtectionProvider,
   FailMode,
   Gateway,
   GatewayConfig,
   GatewayHooks,
   GatewayProbes,
   GatewayResponse,
-  JwtAuthConfig,
+  HedgingConfig,
+  IdempotencyConfig,
+  LoadSheddingConfig,
+  MappedRouteConfig,
+  MetricOutcome,
+  PathRouteConfig,
   ShutdownOptions,
   RateLimitResult,
   RateLimitRule,
+  RateLimitSource,
   RateLimiterOptions,
   RedisLike,
   RequestContext,
-  RouteAuth,
   RouteCacheConfig,
   RouteConfig,
+  RouteInput,
+  RouteMapInput,
   RoutePrefix,
+  RouteReloadConfig,
+  RoutesInput,
+  UpstreamPoolMetrics,
   UpstreamResponseInfo,
   UpstreamTarget,
+  UpstreamTargetInput,
   UpstreamUrl,
-  VerifiedIdentity,
 };

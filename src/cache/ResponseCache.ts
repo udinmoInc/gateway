@@ -1,6 +1,7 @@
 import { DEFAULTS } from '../constants.js';
 import type { GatewayStore } from '../types.js';
 import { storeGet, storeSet } from '../utils/store.js';
+import { BoundedMap } from '../shared/BoundedMap.js';
 
 export interface CacheEntry {
   statusCode: number;
@@ -30,9 +31,8 @@ interface L2Payload {
  * entries and serve STALE across the fleet.
  */
 export class ResponseCache {
-  private readonly map = new Map<string, CacheEntry>();
+  private readonly map: BoundedMap<string, CacheEntry>;
   private readonly ttlMs: number;
-  private readonly maxEntries: number;
   private readonly now: () => number;
   private readonly store: GatewayStore | undefined;
   private readonly l2Prefix: string;
@@ -45,18 +45,20 @@ export class ResponseCache {
     l2Prefix: string = DEFAULTS.resilience.l2KeyPrefix,
   ) {
     this.ttlMs = ttlMs;
-    this.maxEntries = maxEntries;
     this.now = now;
+    this.map = new BoundedMap<string, CacheEntry>({
+      maxEntries,
+      mode: 'lru',
+      now,
+    });
     this.store = store;
     this.l2Prefix = l2Prefix;
   }
 
   /** Synchronous L1-only lookup (hot path). */
   lookup(key: string): CacheLookup {
-    const entry = this.map.get(key);
+    const entry = this.map.get(key); // 'lru' refreshes recency
     if (entry === undefined) return {};
-    this.map.delete(key);
-    this.map.set(key, entry);
     return this.freshness(entry);
   }
 
@@ -130,7 +132,7 @@ export class ResponseCache {
     };
     const retention =
       this.ttlMs * DEFAULTS.resilience.l2StaleRetentionFactor;
-    void storeSet(this.store, this.l2Key(key), JSON.stringify(payload), retention).catch(
+    await storeSet(this.store, this.l2Key(key), JSON.stringify(payload), retention).catch(
       () => undefined,
     );
   }
@@ -142,13 +144,7 @@ export class ResponseCache {
   }
 
   private setLocal(key: string, entry: CacheEntry): void {
-    this.map.delete(key);
-    this.map.set(key, entry);
-    while (this.map.size > this.maxEntries) {
-      const oldest = this.map.keys().next();
-      if (oldest.done) break;
-      this.map.delete(oldest.value);
-    }
+    this.map.set(key, entry); // bounded LRU eviction is automatic
   }
 
   private l2Key(key: string): string {

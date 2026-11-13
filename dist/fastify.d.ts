@@ -1,11 +1,10 @@
 import { FastifyInstance } from 'fastify';
-import { G as GatewayConfig, R as RouteConfig, a as Gateway } from './GatewayEngine-Ba8hOw4K.js';
-export { c as createGateway } from './GatewayEngine-Ba8hOw4K.js';
+import { G as Gateway } from './GatewayEngine-DmwnEblF.js';
+export { a as GatewayConfig, R as RouteConfig, c as createGateway } from './GatewayEngine-DmwnEblF.js';
+import { A as AdapterGatewayConfig } from './adapterCore-9O5pMn_7.js';
 import 'node:http';
 
-interface FastifyGatewayOptions extends Omit<GatewayConfig, 'routes'> {
-    routes: readonly RouteConfig[];
-}
+type FastifyGatewayOptions = AdapterGatewayConfig;
 /**
  * Fastify adapter using the onRequest lifecycle + reply.hijack().
  *
@@ -17,4 +16,4 @@ interface FastifyGatewayOptions extends Omit<GatewayConfig, 'routes'> {
  */
 declare function registerGateway(fastify: FastifyInstance, config: FastifyGatewayOptions): Gateway;
 
-export { type FastifyGatewayOptions, Gateway, GatewayConfig, RouteConfig, registerGateway };
+export { type FastifyGatewayOptions, Gateway, registerGateway };

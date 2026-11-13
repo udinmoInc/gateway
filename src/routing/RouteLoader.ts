@@ -16,7 +16,8 @@ interface RawRoute {
   prefix?: unknown;
   to?: unknown;
   upstreams?: unknown;
-  auth?: unknown;
+  guards?: unknown;
+  stripHeaders?: unknown;
   rateLimit?: unknown;
   cache?: unknown;
   stripPrefix?: unknown;
@@ -106,7 +107,10 @@ function normalizeRaw(raw: unknown, file: string): RouteDefinition {
 
   const def: RouteDefinition = { path: pathValue as `/${string}`, to };
   const opts: RouteShortcut = {};
-  if (r.auth !== undefined) opts.auth = r.auth as NonNullable<RouteShortcut['auth']>;
+  if (r.guards !== undefined) opts.guards = r.guards as NonNullable<RouteShortcut['guards']>;
+  if (r.stripHeaders !== undefined) {
+    opts.stripHeaders = r.stripHeaders as NonNullable<RouteShortcut['stripHeaders']>;
+  }
   if (r.rateLimit !== undefined) {
     opts.rateLimit = r.rateLimit as NonNullable<RouteShortcut['rateLimit']>;
   }

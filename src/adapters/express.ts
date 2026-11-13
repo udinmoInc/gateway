@@ -1,12 +1,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createGateway } from '../core/GatewayEngine.js';
 import type { Gateway } from '../core/GatewayEngine.js';
 import type { GatewayConfig, RouteConfig } from '../types.js';
+import { createAdapterGateway, routeMatches } from './adapterCore.js';
+import type { AdapterGatewayConfig } from './adapterCore.js';
 
-export interface ExpressGatewayOptions<TReq extends IncomingMessage = IncomingMessage>
-  extends Omit<GatewayConfig<TReq>, 'routes'> {
-  routes: readonly RouteConfig<TReq>[];
-}
+export type ExpressGatewayOptions<
+  TReq extends IncomingMessage = IncomingMessage,
+> = AdapterGatewayConfig<TReq>;
 
 /**
  * Express middleware adapter.
@@ -18,7 +18,7 @@ export interface ExpressGatewayOptions<TReq extends IncomingMessage = IncomingMe
 export function gatewayMiddleware<TReq extends IncomingMessage = IncomingMessage>(
   config: ExpressGatewayOptions<TReq>,
 ) {
-  const gateway: Gateway<TReq> = createGateway<TReq>(config);
+  const gateway: Gateway<TReq> = createAdapterGateway<TReq>(config);
 
   return function gatewayExpressMiddleware(
     req: IncomingMessage,
@@ -26,8 +26,7 @@ export function gatewayMiddleware<TReq extends IncomingMessage = IncomingMessage
     next?: (err?: unknown) => void,
   ): void {
     // Only handle requests that match a configured route prefix.
-    const matched = gateway.router.resolve(req as TReq) !== undefined;
-    if (!matched) {
+    if (!routeMatches(gateway, req)) {
       if (next) {
         next();
         return;
@@ -40,5 +39,5 @@ export function gatewayMiddleware<TReq extends IncomingMessage = IncomingMessage
   };
 }
 
-export { createGateway };
+export { createGateway } from '../core/GatewayEngine.js';
 export type { Gateway, GatewayConfig, RouteConfig };

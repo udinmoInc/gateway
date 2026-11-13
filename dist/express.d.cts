@@ -1,10 +1,8 @@
 import { IncomingMessage, ServerResponse } from 'node:http';
-import { G as GatewayConfig, R as RouteConfig } from './GatewayEngine-Ba8hOw4K.cjs';
-export { a as Gateway, c as createGateway } from './GatewayEngine-Ba8hOw4K.cjs';
+export { G as Gateway, a as GatewayConfig, R as RouteConfig, c as createGateway } from './GatewayEngine-DmwnEblF.cjs';
+import { A as AdapterGatewayConfig } from './adapterCore-CLul9gfj.cjs';
 
-interface ExpressGatewayOptions<TReq extends IncomingMessage = IncomingMessage> extends Omit<GatewayConfig<TReq>, 'routes'> {
-    routes: readonly RouteConfig<TReq>[];
-}
+type ExpressGatewayOptions<TReq extends IncomingMessage = IncomingMessage> = AdapterGatewayConfig<TReq>;
 /**
  * Express middleware adapter.
  *
@@ -14,4 +12,4 @@ interface ExpressGatewayOptions<TReq extends IncomingMessage = IncomingMessage> 
  */
 declare function gatewayMiddleware<TReq extends IncomingMessage = IncomingMessage>(config: ExpressGatewayOptions<TReq>): (req: IncomingMessage, res: ServerResponse, next?: (err?: unknown) => void) => void;
 
-export { type ExpressGatewayOptions, GatewayConfig, RouteConfig, gatewayMiddleware };
+export { type ExpressGatewayOptions, gatewayMiddleware };

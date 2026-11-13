@@ -1,29 +1,31 @@
 import type {
+  CacheInput,
+  CircuitBreakerInput,
   CircuitBreakerOptions,
   ClientKeyExtractor,
+  DurationString,
+  EdgeGuard,
+  RateLimitInput,
   RateLimitRule,
+  RateLimitString,
   RouteCacheConfig,
   RouteConfig,
   RoutePrefix,
+  UpstreamInput,
   UpstreamTarget,
-  UpstreamUrl,
 } from '../types.js';
 import type { IncomingMessage } from 'node:http';
+import { toUpstreamTargets } from '../shared/httpUtils.js';
 
-export type RateLimitString = `${number}/sec` | `${number}/min` | `${number}/hour`;
-export type DurationString =
-  | `${number}ms`
-  | `${number}s`
-  | `${number}m`
-  | `${number}h`
-  | `${number}d`;
-
-export type RateLimitInput = RateLimitRule | RateLimitString;
-export type CacheInput = number | DurationString | RouteCacheConfig;
-export type UpstreamInput =
-  | `http://${string}`
-  | `https://${string}`
-  | readonly (`http://${string}` | `https://${string}`)[];
+// Canonical shorthand types live in types.ts — re-exported here so
+// existing `from './routing/dsl.js'` imports keep working.
+export type {
+  CacheInput,
+  DurationString,
+  RateLimitInput,
+  RateLimitString,
+  UpstreamInput,
+} from '../types.js';
 
 const RATE_LIMIT_RE = /^(\d+(?:\.\d+)?)\/(sec|min|hour)$/;
 const UNIT_SECONDS: Record<string, number> = { sec: 1, min: 60, hour: 3600 };
@@ -35,8 +37,6 @@ const DURATION_UNIT_MS: Record<string, number> = {
   h: 3_600_000,
   d: 86_400_000,
 };
-
-const UPSTREAM_RE = /^https?:\/\/\S+$/;
 
 /** Parse '60/sec' | '120/min' | '1000/hour' → token bucket rule. Throws on malformed input. */
 export function parseRateLimit(input: RateLimitInput): RateLimitRule {
@@ -80,7 +80,7 @@ export function parseDurationMs(input: number | DurationString): number {
   return Math.round(value * unitMs);
 }
 
-function parseCache(input: CacheInput): RouteCacheConfig {
+export function parseCacheInput(input: CacheInput): RouteCacheConfig {
   if (typeof input === 'object') return input;
   return { ttlMs: parseDurationMs(input) };
 }
@@ -98,23 +98,17 @@ export function normalizePrefix(path: string): string {
 function toTargets(
   to: UpstreamInput,
 ): readonly [UpstreamTarget, ...UpstreamTarget[]] {
-  const list = (Array.isArray(to) ? to : [to]) as readonly string[];
-  if (list.length === 0) throw new Error('[gateway] Route requires at least one upstream.');
-  const targets = list.map((url) => {
-    if (!UPSTREAM_RE.test(url)) {
-      throw new Error(`[gateway] Invalid upstream URL "${url}" — must start with http:// or https://.`);
-    }
-    return { url: url as UpstreamUrl };
-  });
-  return targets as [UpstreamTarget, ...UpstreamTarget[]];
+  // Shared runtime builder — validates URLs/weights and brands targets.
+  return toUpstreamTargets(to);
 }
 
 export interface RouteShortcut<TReq extends IncomingMessage = IncomingMessage> {
-  auth?: boolean | readonly string[];
+  guards?: readonly EdgeGuard<TReq>[];
+  stripHeaders?: readonly string[];
   rateLimit?: RateLimitInput;
   cache?: CacheInput;
   stripPrefix?: boolean;
-  circuitBreaker?: Partial<CircuitBreakerOptions>;
+  circuitBreaker?: CircuitBreakerInput;
   extractClientKey?: ClientKeyExtractor<TReq>;
 }
 
@@ -131,11 +125,19 @@ function buildRoute<TReq extends IncomingMessage>(
     prefix: normalizePrefix(def.path) as RoutePrefix,
     upstreams: toTargets(def.to),
   };
-  if (def.auth !== undefined) route.auth = def.auth;
+  if (def.guards !== undefined) route.guards = def.guards;
+  if (def.stripHeaders !== undefined) route.stripHeaders = def.stripHeaders;
   if (def.rateLimit !== undefined) route.rateLimit = parseRateLimit(def.rateLimit);
-  if (def.cache !== undefined) route.cache = parseCache(def.cache);
+  if (def.cache !== undefined) route.cache = parseCacheInput(def.cache);
   if (def.stripPrefix !== undefined) route.stripPrefix = def.stripPrefix;
-  if (def.circuitBreaker !== undefined) route.circuitBreaker = def.circuitBreaker;
+  if (def.circuitBreaker !== undefined) {
+    const { openDurationMs, ...rest } = def.circuitBreaker;
+    const cb: Partial<CircuitBreakerOptions> = { ...rest };
+    if (openDurationMs !== undefined) {
+      cb.openDurationMs = parseDurationMs(openDurationMs);
+    }
+    route.circuitBreaker = cb;
+  }
   if (def.extractClientKey !== undefined) route.extractClientKey = def.extractClientKey;
   return route;
 }

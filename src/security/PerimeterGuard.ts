@@ -55,27 +55,47 @@ export function assertNoMetadataUpstreams(
   }
 }
 
-/** True when the request path contains traversal/injection segments. */
+/** Max percent-decode passes applied when checking for traversal. */
+const MAX_DECODE_PASSES = 3;
+
+/**
+ * True when the request path contains traversal/injection segments.
+ * Applies up to MAX_DECODE_PASSES bounded decode passes so multi-encoded
+ * payloads (e.g. %252e%252e) cannot bypass the check, and malformed
+ * percent sequences are treated as hostile (→ 400) rather than throwing.
+ */
 export function isPathTraversal(pathname: string): boolean {
-  return TRAVERSAL_RE.test(pathname);
+  if (TRAVERSAL_RE.test(pathname)) return true;
+  let current = pathname;
+  for (let i = 0; i < MAX_DECODE_PASSES; i += 1) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      return true; // malformed percent-encoding → reject as traversal
+    }
+    if (decoded === current) return false;
+    if (TRAVERSAL_RE.test(decoded)) return true;
+    current = decoded;
+  }
+  return TRAVERSAL_RE.test(current);
 }
 
-/** Strip CR/LF from a header value (CRLF injection defense). */
-export function sanitizeHeaderValue(value: string): string {
-  return value.replace(/[\r\n]+/g, '');
-}
+// sanitizeHeaderValue lives in shared/httpUtils (single source); re-exported
+// here for backwards compatibility.
+export { sanitizeHeaderValue } from '../shared/httpUtils.js';
 
-/** Content-Type enforcement for routes with allowedContentTypes. */
+/** Content-Type enforcement for routes with allowedContentTypes (pre-normalized lowercase Set). */
 export function contentTypeAllowed(
   req: IncomingMessage,
-  allowed: readonly string[],
+  allowed: ReadonlySet<string>,
 ): boolean {
   const method = req.method ?? 'GET';
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return true;
   const contentType = getHeaderString(req, 'content-type');
   if (!contentType) return false;
   const mime = contentType.split(';', 1)[0]?.trim().toLowerCase() ?? '';
-  return allowed.some((a) => a.toLowerCase() === mime);
+  return allowed.has(mime);
 }
 
 // ---------- CORS ----------

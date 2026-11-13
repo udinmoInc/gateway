@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { DEFAULTS, HEADERS, HOP_BY_HOP_HEADERS, STATUS } from '../constants.js';
+import { DEFAULTS, HEADERS, STATUS } from '../constants.js';
+import { HOP_BY_HOP_SET } from '../shared/httpUtils.js';
+import { sleep } from '../shared/timers.js';
 import type { GatewayStore, IdempotencyConfig } from '../types.js';
 import { storeDel, storeGet, storeSet, storeSetNX } from '../utils/store.js';
 
@@ -18,17 +20,14 @@ export interface IdempotentResult {
 interface StoredState {
   state: 'IN_PROGRESS' | 'COMPLETED';
   fingerprint: string;
+  node?: string;
   statusCode?: number;
   headers?: Record<string, string>;
   body?: string; // base64
 }
 
-const HOP = new Set<string>(HOP_BY_HOP_HEADERS);
+const HOP = HOP_BY_HOP_SET;
 const REPLAY_EXCLUDED = new Set(['x-idempotent-replay']);
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function jittered(ms: number): number {
   return ms + Math.floor(Math.random() * ms);

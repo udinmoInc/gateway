@@ -7,7 +7,11 @@ export interface SignInput {
   secret: string;
   method: string;
   path: string;
-  userId: string;
+  /**
+   * Generic subject bound into the signature (e.g. a tag value like
+   * tenant id). Empty string when no subject is configured.
+   */
+  subject: string;
   requestId: string;
   timestampMs?: number;
   headerName?: string;
@@ -18,10 +22,10 @@ function signaturePayload(
   timestampMs: number,
   method: string,
   path: string,
-  userId: string,
+  subject: string,
   requestId: string,
 ): string {
-  return `${timestampMs}.${method.toUpperCase()}.${path}.${userId}.${requestId}`;
+  return `${timestampMs}.${method.toUpperCase()}.${path}.${subject}.${requestId}`;
 }
 
 function hmac(payload: string, secret: string): string {
@@ -44,7 +48,7 @@ export function signGatewayRequest(input: SignInput): SignResult {
   const timestampHeader =
     input.timestampHeader ?? DEFAULTS.perimeter.signatureTimestampHeader;
   const signature = hmac(
-    signaturePayload(timestampMs, input.method, input.path, input.userId, input.requestId),
+    signaturePayload(timestampMs, input.method, input.path, input.subject, input.requestId),
     input.secret,
   );
   return {
@@ -59,6 +63,11 @@ export function signGatewayRequest(input: SignInput): SignResult {
 export interface VerifyOptions {
   headerName?: string;
   timestampHeader?: string;
+  /**
+   * Header carrying the signed subject (default 'x-gateway-subject').
+   * Must match the `subjectHeader` used at signing time.
+   */
+  subjectHeader?: string;
   /** Injectable clock for tests. */
   now?: () => number;
 }
@@ -89,6 +98,8 @@ export function verifyGatewaySignature(
   const headerName = options.headerName ?? DEFAULTS.perimeter.signatureHeader;
   const timestampHeader =
     options.timestampHeader ?? DEFAULTS.perimeter.signatureTimestampHeader;
+  const subjectHeader =
+    options.subjectHeader ?? HEADERS.gatewaySubject;
 
   const signature = headerValue(headers, headerName);
   const timestampRaw = headerValue(headers, timestampHeader);
@@ -100,13 +111,13 @@ export function verifyGatewaySignature(
   const now = options.now?.() ?? Date.now();
   if (Math.abs(now - timestampMs) > maxAgeMs) return false;
 
-  // userId/requestId are embedded in the signed payload; extract them from
-  // the identity headers the gateway also forwards.
-  const userId = headerValue(headers, HEADERS.userId) ?? '';
+  // subject/requestId are embedded in the signed payload; extract them
+  // from the headers the gateway also forwards.
+  const subject = headerValue(headers, subjectHeader) ?? '';
   const requestId = headerValue(headers, HEADERS.requestId) ?? '';
 
   const expected = hmac(
-    signaturePayload(timestampMs, method, path, userId, requestId),
+    signaturePayload(timestampMs, method, path, subject, requestId),
     secret,
   );
   const a = Buffer.from(signature, 'utf8');
@@ -120,6 +131,8 @@ export function resolveSigningConfig(
 ): Required<UpstreamSigningConfig> {
   return {
     secret: config.secret,
+    subjectTag: config.subjectTag ?? '',
+    subjectHeader: config.subjectHeader ?? HEADERS.gatewaySubject,
     headerName: config.headerName ?? DEFAULTS.perimeter.signatureHeader,
     timestampHeader:
       config.timestampHeader ?? DEFAULTS.perimeter.signatureTimestampHeader,

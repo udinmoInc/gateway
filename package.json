@@ -22,7 +22,15 @@
       "import": "./dist/fastify.mjs",
       "require": "./dist/fastify.cjs"
     },
+    "./fetch": {
+      "types": "./dist/fetch.d.ts",
+      "import": "./dist/fetch.mjs",
+      "require": "./dist/fetch.cjs"
+    },
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "udinmo-gateway": "./dist/cli.mjs"
   },
   "files": [
     "dist",
@@ -35,6 +43,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "audit:security": "node scripts/security-audit.mjs",
     "prepublishOnly": "npm run build && npm run typecheck"
   },
   "keywords": [
@@ -64,6 +73,7 @@
     }
   },
   "devDependencies": {
+    "@types/express": "^4.17.25",
     "@types/node": "^20.11.0",
     "express": "^4.19.2",
     "fastify": "^4.26.2",

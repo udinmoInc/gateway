@@ -3,10 +3,8 @@ import { DEFAULTS } from '../constants.js';
 import type { GatewayStore } from '../types.js';
 import type { CacheEntry } from './ResponseCache.js';
 import { storeDel, storeSetNX } from '../utils/store.js';
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+import { BoundedMap } from '../shared/BoundedMap.js';
+import { sleep } from '../shared/timers.js';
 
 /**
  * Two-layer request coalescing for cacheable GET/HEAD traffic:
@@ -18,7 +16,7 @@ function sleep(ms: number): Promise<void> {
  *    cache and replay the populated entry (X-Coalesced: true).
  */
 export class RequestCoalescer {
-  private readonly inflight = new Map<string, Promise<CacheEntry>>();
+  private readonly inflight: BoundedMap<string, Promise<CacheEntry>>;
   private readonly store: GatewayStore | undefined;
   private readonly leaseMs: number;
   private readonly waitMs: number;
@@ -27,9 +25,19 @@ export class RequestCoalescer {
 
   constructor(
     store: GatewayStore | undefined,
-    options: { leaseMs?: number; waitMs?: number; pollMs?: number; nodeId?: string } = {},
+    options: {
+      leaseMs?: number;
+      waitMs?: number;
+      pollMs?: number;
+      nodeId?: string;
+      /** Bound on concurrent in-flight upstream fetches. */
+      maxInflight?: number;
+    } = {},
   ) {
     this.store = store;
+    this.inflight = new BoundedMap<string, Promise<CacheEntry>>({
+      maxEntries: options.maxInflight ?? DEFAULTS.cache.maxEntries,
+    });
     this.leaseMs = options.leaseMs ?? DEFAULTS.resilience.coalesceLeaseMs;
     this.waitMs = options.waitMs ?? DEFAULTS.resilience.coalesceWaitMs;
     this.pollMs = options.pollMs ?? DEFAULTS.resilience.coalescePollMs;

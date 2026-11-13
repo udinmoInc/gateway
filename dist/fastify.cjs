@@ -36,8 +36,9 @@ __export(fastify_exports, {
 module.exports = __toCommonJS(fastify_exports);
 
 // src/core/GatewayEngine.ts
-var import_node_http2 = __toESM(require("http"), 1);
-var import_node_perf_hooks = require("perf_hooks");
+var import_node_http3 = __toESM(require("http"), 1);
+var import_node_crypto6 = require("crypto");
+var import_node_perf_hooks2 = require("perf_hooks");
 
 // src/constants.ts
 var HEADERS = {
@@ -47,16 +48,15 @@ var HEADERS = {
   rateLimitLimit: "x-ratelimit-limit",
   rateLimitRemaining: "x-ratelimit-remaining",
   rateLimitReset: "x-ratelimit-reset",
+  rateLimitSource: "x-ratelimit-source",
   retryAfter: "retry-after",
   apiKey: "x-api-key",
   authorization: "authorization",
   gatewayCache: "x-gateway-cache",
   cacheControl: "cache-control",
   connection: "connection",
-  userId: "x-user-id",
-  userRole: "x-user-role",
   requestId: "x-request-id",
-  wwwAuthenticate: "www-authenticate",
+  gatewaySubject: "x-gateway-subject",
   gatewayTimestamp: "x-gateway-timestamp",
   gatewaySignature: "x-gateway-signature",
   contentTypeOptions: "x-content-type-options",
@@ -71,13 +71,11 @@ var HEADERS = {
   accessControlAllowHeaders: "access-control-allow-headers",
   accessControlAllowCredentials: "access-control-allow-credentials",
   accessControlMaxAge: "access-control-max-age",
-  apiKeyHeader: "x-api-key"
+  apiKeyHeader: "x-api-key",
+  idempotencyKey: "idempotency-key",
+  idempotentReplay: "x-idempotent-replay",
+  coalesced: "x-coalesced"
 };
-var IDENTITY_HEADERS = [
-  "x-user-id",
-  "x-user-role",
-  "x-session-id"
-];
 var STATUS = {
   ok: 200,
   created: 201,
@@ -90,7 +88,9 @@ var STATUS = {
   forbidden: 403,
   payloadTooLarge: 413,
   unsupportedMediaType: 415,
-  locked: 423
+  locked: 423,
+  conflict: 409,
+  unprocessableEntity: 422
 };
 var ERROR_CODES = {
   rateLimited: "RATE_LIMITED",
@@ -105,14 +105,15 @@ var ERROR_CODES = {
   payloadTooLarge: "PAYLOAD_TOO_LARGE",
   unsupportedMediaType: "UNSUPPORTED_MEDIA_TYPE",
   policyDenied: "POLICY_DENIED",
-  apiKeyInvalid: "API_KEY_INVALID",
-  locked: "LOCKED"
+  locked: "LOCKED",
+  idempotencyMismatch: "IDEMPOTENCY_MISMATCH",
+  conflict: "CONFLICT",
+  overloaded: "OVERLOADED"
 };
 var SECURITY_EVENT_TYPES = {
   pathTraversalBlocked: "PATH_TRAVERSAL_BLOCKED",
   bruteForceLocked: "BRUTE_FORCE_LOCKED",
   authDenied: "AUTH_DENIED",
-  apiKeyDenied: "API_KEY_DENIED",
   policyDenied: "POLICY_DENIED"
 };
 var CACHE_STATUS = {
@@ -186,14 +187,34 @@ var DEFAULTS = {
     signatureMaxAgeMs: 6e4,
     signatureHeader: "x-gateway-signature",
     signatureTimestampHeader: "x-gateway-timestamp",
-    apiKeyHashPrefix: "sha256:",
     bruteForceKeyPrefix: "gw:bf:",
     upstreamFingerprintHeaders: ["x-powered-by", "server"]
   },
-  auth: {
-    jwtLeewaySec: 30,
-    jwksCacheTtlMs: 3e5,
-    authCacheKeyPrefix: "gw:auth:"
+  resilience: {
+    idempotencyTtlMs: 864e5,
+    // 24h
+    idempotencyLockTimeoutMs: 3e4,
+    idempotencyMethods: ["POST", "PATCH", "DELETE"],
+    idempotencyKeyPrefix: "gw:idem:",
+    coalesceLeaseMs: 3e3,
+    coalesceWaitMs: 2800,
+    coalescePollMs: 100,
+    leaseKeyPrefix: "gw:lease:",
+    l2KeyPrefix: "gw:l2:",
+    cbKeyPrefix: "gw:cb:",
+    l2StaleRetentionFactor: 2
+  },
+  networking: {
+    eventLoopResolutionMs: 20,
+    maxEventLoopDelayMs: 150,
+    shedRetryAfterSec: 1,
+    upstreamMaxSockets: 256,
+    upstreamMaxFreeSockets: 64,
+    upstreamKeepAliveMsecs: 4e3,
+    serverKeepAliveTimeoutMs: 5e3,
+    serverHeadersTimeoutMs: 6e4,
+    serverRequestTimeoutMs: 3e5,
+    upgradeHandshakeTimeoutMs: 1e4
   }
 };
 var HOP_BY_HOP_HEADERS = [
@@ -207,11 +228,92 @@ var HOP_BY_HOP_HEADERS = [
   "upgrade"
 ];
 
-// src/utils/extractors.ts
-function getHeaderString(req, name) {
-  const value = req.headers[name.toLowerCase()];
+// src/shared/httpUtils.ts
+var UPSTREAM_URL_RE = /^https?:\/\/\S+$/;
+function asRoutePrefix(prefix) {
+  if (!prefix.startsWith("/")) {
+    throw new Error(`[gateway] Route path must start with '/', got "${prefix}".`);
+  }
+  return prefix;
+}
+function asUpstreamUrl(url) {
+  if (!UPSTREAM_URL_RE.test(url)) {
+    throw new Error(
+      `[gateway] Invalid upstream URL "${url}" \u2014 must start with http:// or https://.`
+    );
+  }
+  return url;
+}
+function expandTargetUrl(value) {
+  if (typeof value === "number") {
+    if (Number.isInteger(value) && value > 0 && value <= 65535) {
+      return `http://localhost:${value}`;
+    }
+    throw new Error(`[gateway] invalid port number ${value}.`);
+  }
+  if (typeof value === "string") {
+    if (UPSTREAM_URL_RE.test(value)) return value;
+    if (/^:?\d{1,5}$/.test(value)) {
+      const port = Number(value.replace(":", ""));
+      if (port > 0 && port <= 65535) return `http://localhost:${port}`;
+      throw new Error(`[gateway] invalid port "${value}".`);
+    }
+    if (/^[^\s/:]+:\d{1,5}$/.test(value)) {
+      const port = Number(value.slice(value.lastIndexOf(":") + 1));
+      if (port > 0 && port <= 65535) return `http://${value}`;
+      throw new Error(`[gateway] invalid port in "${value}".`);
+    }
+    throw new Error(
+      `[gateway] Invalid upstream URL "${value}" \u2014 must start with http:// or https://.`
+    );
+  }
+  throw new Error(
+    `[gateway] invalid upstream target ${JSON.stringify(value)} \u2014 expected a URL, port, or 'host:port'.`
+  );
+}
+function toUpstreamTargets(input) {
+  const list = Array.isArray(input) ? input : [input];
+  if (list.length === 0) {
+    throw new Error("[gateway] Route requires at least one upstream.");
+  }
+  const targets = list.map((item) => {
+    if (typeof item === "string" || typeof item === "number") {
+      return { url: asUpstreamUrl(expandTargetUrl(item)) };
+    }
+    if (typeof item === "object" && item !== null) {
+      const rec = item;
+      const target = {
+        url: asUpstreamUrl(expandTargetUrl(rec.url))
+      };
+      if (rec.weight !== void 0) {
+        if (typeof rec.weight !== "number" || !Number.isFinite(rec.weight) || rec.weight <= 0) {
+          throw new Error("[gateway] upstream weight must be a positive number.");
+        }
+        target.weight = rec.weight;
+      }
+      return target;
+    }
+    throw new Error("[gateway] invalid upstream target.");
+  });
+  return targets;
+}
+var HOP_BY_HOP_SET = new Set(HOP_BY_HOP_HEADERS);
+function hopByHopSet(extra) {
+  if (extra === void 0 || extra.length === 0) return HOP_BY_HOP_SET;
+  return /* @__PURE__ */ new Set([...HOP_BY_HOP_HEADERS, ...extra]);
+}
+function sanitizeHeaderValue(value) {
+  return value.replace(/[\r\n]+/g, "");
+}
+function headerString(headers, name) {
+  const value = headers[name.toLowerCase()];
   if (value === void 0) return void 0;
   return Array.isArray(value) ? value[0] : value;
+}
+
+// src/utils/extractors.ts
+function getHeaderString(req, name) {
+  return headerString(req.headers, name);
 }
 function firstForwardedIp(value) {
   if (!value) return void 0;
@@ -233,6 +335,129 @@ function resolveExtractor(route2, globalExtractor) {
   return route2.extractClientKey ?? globalExtractor ?? extractApiKeyOrIp;
 }
 
+// src/shared/BoundedMap.ts
+var BoundedMap = class {
+  slots = /* @__PURE__ */ new Map();
+  maxEntries;
+  mode;
+  now;
+  constructor(options) {
+    this.maxEntries = Math.max(1, Math.floor(options.maxEntries));
+    this.mode = options.mode ?? "fifo";
+    this.now = options.now ?? Date.now;
+  }
+  get size() {
+    return this.slots.size;
+  }
+  /** Live (non-expired) entry count — used by tests/metrics. */
+  get liveSize() {
+    let n = 0;
+    for (const key of this.slots.keys()) {
+      if (this.live(key)) n += 1;
+    }
+    return n;
+  }
+  live(key) {
+    const slot = this.slots.get(key);
+    if (slot === void 0) return false;
+    if (slot.expiresAt !== void 0 && slot.expiresAt <= this.now()) {
+      this.slots.delete(key);
+      return false;
+    }
+    return true;
+  }
+  /** Returns the value, or undefined when missing/expired. LRU refreshes. */
+  get(key) {
+    const slot = this.slots.get(key);
+    if (slot === void 0) return void 0;
+    if (slot.expiresAt !== void 0 && slot.expiresAt <= this.now()) {
+      this.slots.delete(key);
+      return void 0;
+    }
+    if (this.mode === "lru") {
+      this.slots.delete(key);
+      this.slots.set(key, slot);
+    }
+    return slot.value;
+  }
+  /** Raw slot access for callers needing expiry metadata (e.g. incr TTL). */
+  entry(key) {
+    const slot = this.slots.get(key);
+    if (slot === void 0) return void 0;
+    if (slot.expiresAt !== void 0 && slot.expiresAt <= this.now()) {
+      this.slots.delete(key);
+      return void 0;
+    }
+    if (this.mode === "lru") {
+      this.slots.delete(key);
+      this.slots.set(key, slot);
+    }
+    return { value: slot.value, expiresAt: slot.expiresAt };
+  }
+  /**
+   * Insert/overwrite. `ttlMs` > 0 arms lazy expiry; evicts the oldest
+   * entry (or least-recently-used in 'lru' mode) when at capacity.
+   */
+  set(key, value, ttlMs) {
+    const expiresAt = ttlMs !== void 0 && ttlMs > 0 ? this.now() + ttlMs : void 0;
+    const existing = this.slots.get(key);
+    if (existing !== void 0) {
+      this.slots.delete(key);
+    } else if (this.slots.size >= this.maxEntries) {
+      const oldest = this.slots.keys().next();
+      if (!oldest.done) this.slots.delete(oldest.value);
+    }
+    this.slots.set(key, { value, expiresAt });
+  }
+  /** Set only when absent (SET NX semantics for locks/leases). */
+  setIfAbsent(key, value, ttlMs) {
+    if (this.get(key) !== void 0) return false;
+    this.set(key, value, ttlMs);
+    return true;
+  }
+  delete(key) {
+    return this.slots.delete(key);
+  }
+  has(key) {
+    return this.get(key) !== void 0;
+  }
+  /** Arm/replace the TTL on a live entry. Returns false when missing/expired. */
+  expire(key, ttlMs) {
+    const slot = this.slots.get(key);
+    if (slot === void 0 || !this.live(key)) return false;
+    slot.expiresAt = this.now() + ttlMs;
+    return true;
+  }
+  /** Milliseconds until expiry, or undefined when no TTL / missing. */
+  ttlRemainingMs(key) {
+    const slot = this.slots.get(key);
+    if (slot === void 0 || slot.expiresAt === void 0) return void 0;
+    if (slot.expiresAt <= this.now()) {
+      this.slots.delete(key);
+      return void 0;
+    }
+    return slot.expiresAt - this.now();
+  }
+  keys() {
+    return this.slots.keys();
+  }
+  *values() {
+    for (const key of this.slots.keys()) {
+      const v = this.get(key);
+      if (v !== void 0) yield v;
+    }
+  }
+  *entries() {
+    for (const key of this.slots.keys()) {
+      const v = this.get(key);
+      if (v !== void 0) yield [key, v];
+    }
+  }
+  clear() {
+    this.slots.clear();
+  }
+};
+
 // src/utils/http.ts
 function sendJson(res, statusCode, payload, extraHeaders) {
   if (res.headersSent || res.writableEnded) return;
@@ -243,6 +468,26 @@ function sendJson(res, statusCode, payload, extraHeaders) {
     ...extraHeaders
   });
   res.end(body);
+}
+var ERROR_BODY_CACHE_MAX = 256;
+var errorBodyCache = new BoundedMap({
+  maxEntries: ERROR_BODY_CACHE_MAX
+});
+function sendErrorJson(res, statusCode, code, message, extraHeaders) {
+  if (res.headersSent || res.writableEnded) return;
+  const key = JSON.stringify([statusCode, code, message]);
+  let cached = errorBodyCache.get(key);
+  if (cached === void 0) {
+    const body = JSON.stringify(defaultErrorBody(code, message));
+    cached = { body, length: Buffer.byteLength(body) };
+    errorBodyCache.set(key, cached);
+  }
+  res.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": cached.length,
+    ...extraHeaders
+  });
+  res.end(cached.body);
 }
 function sendGatewayResponse(res, response) {
   if (res.headersSent || res.writableEnded) return;
@@ -269,19 +514,17 @@ function secondsUntil(epochSeconds, nowMs) {
 
 // src/limiter/LocalFallback.ts
 var LocalFallback = class {
-  buckets = /* @__PURE__ */ new Map();
-  maxKeys;
+  buckets;
   constructor(maxKeys = DEFAULTS.limiter.localMaxKeys) {
-    this.maxKeys = maxKeys;
+    this.buckets = new BoundedMap({
+      maxEntries: maxKeys,
+      mode: "lru"
+    });
   }
   consume(key, rule, now = Date.now()) {
     let bucket = this.buckets.get(key);
     if (bucket === void 0) {
-      this.evictIfNeeded();
       bucket = { tokens: rule.capacity, ts: now };
-      this.buckets.set(key, bucket);
-    } else {
-      this.buckets.delete(key);
       this.buckets.set(key, bucket);
     }
     const elapsedSec = Math.max(0, (now - bucket.ts) / 1e3);
@@ -309,16 +552,10 @@ var LocalFallback = class {
   get size() {
     return this.buckets.size;
   }
-  evictIfNeeded() {
-    while (this.buckets.size >= this.maxKeys) {
-      const oldest = this.buckets.keys().next();
-      if (oldest.done) break;
-      this.buckets.delete(oldest.value);
-    }
-  }
 };
 
 // src/limiter/scripts.ts
+var import_node_crypto = require("crypto");
 var TOKEN_BUCKET_SCRIPT = `
 local key = KEYS[1]
 local capacity = tonumber(ARGV[1])
@@ -356,24 +593,65 @@ redis.call('PEXPIRE', key, ttlMs)
 
 return { allowed, tokens, capacity, now, retryAfter }
 `;
+var TOKEN_BUCKET_SHA1 = (0, import_node_crypto.createHash)("sha1").update(TOKEN_BUCKET_SCRIPT).digest("hex");
+
+// src/shared/timers.ts
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function deadlineTimer(ms, onTimeout) {
+  let fired = false;
+  let cleared = false;
+  const timer = setTimeout(() => {
+    fired = true;
+    cleared = true;
+    onTimeout();
+  }, ms);
+  timer.unref?.();
+  return {
+    clear() {
+      if (cleared) return;
+      cleared = true;
+      clearTimeout(timer);
+    },
+    get fired() {
+      return fired;
+    }
+  };
+}
+function destroySafely(...targets) {
+  for (const t of targets) {
+    if (t === void 0 || t === null) continue;
+    try {
+      t.destroy();
+    } catch {
+    }
+  }
+}
 
 // src/limiter/RedisRateLimiter.ts
 var DEFAULT_TIMEOUT_MS = 500;
 function withTimeout(promise, ms) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("redis timeout")), ms);
-    timer.unref?.();
+    const timer = deadlineTimer(
+      ms,
+      () => reject(new Error("redis timeout"))
+    );
     promise.then(
       (v) => {
-        clearTimeout(timer);
+        timer.clear();
         resolve(v);
       },
       (e) => {
-        clearTimeout(timer);
+        timer.clear();
         reject(e instanceof Error ? e : new Error(String(e)));
       }
     );
   });
+}
+function isNoScriptError(err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes("NOSCRIPT");
 }
 var RedisRateLimiter = class {
   redis;
@@ -381,6 +659,11 @@ var RedisRateLimiter = class {
   keyPrefix;
   timeoutMs;
   local;
+  /**
+   * Locally-banked batch tokens per Redis key (batchSize > 1 leasing).
+   * Bounded FIFO — high-cardinality keys can't grow it unboundedly.
+   */
+  batchCredits;
   warnedNoRedis = false;
   constructor(options = {}) {
     this.redis = options.redis;
@@ -388,6 +671,9 @@ var RedisRateLimiter = class {
     this.keyPrefix = options.keyPrefix ?? DEFAULTS.redisPrefix;
     this.timeoutMs = options.commandTimeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.local = new LocalFallback(options.localMaxKeys);
+    this.batchCredits = new BoundedMap({
+      maxEntries: options.localMaxKeys ?? DEFAULTS.limiter.localMaxKeys
+    });
     if (!this.redis && !this.warnedNoRedis) {
       this.warnedNoRedis = true;
       console.warn(
@@ -397,25 +683,66 @@ var RedisRateLimiter = class {
   }
   async consume(key, rule) {
     if (!this.redis) {
-      return this.local.consume(key, rule);
+      return { ...this.local.consume(key, rule), source: "local" };
     }
     const redisKey = `${this.keyPrefix}:${key}`;
+    const batch = this.batchFor(rule);
+    if (batch > 1) {
+      const credit = this.batchCredits.get(redisKey) ?? 0;
+      if (credit > 0) {
+        this.batchCredits.set(redisKey, credit - 1);
+        return {
+          allowed: true,
+          remaining: credit - 1,
+          limit: rule.capacity,
+          resetAt: Math.ceil(Date.now() / 1e3) + 1,
+          retryAfterMs: 0,
+          source: "batch"
+        };
+      }
+    }
     try {
-      const raw = await withTimeout(
-        this.redis.eval(
-          TOKEN_BUCKET_SCRIPT,
-          1,
-          redisKey,
-          rule.capacity,
-          rule.refillPerSecond,
-          1
-        ),
-        this.timeoutMs
-      );
-      return this.parseResult(raw, rule);
+      const raw = await this.runScript(redisKey, rule, batch);
+      const result = this.parseResult(raw, rule);
+      if (result.allowed && batch > 1) {
+        this.setBatchCredit(redisKey, batch - 1);
+      }
+      return { ...result, source: "redis" };
     } catch {
       return this.handleFailure(key, rule);
     }
+  }
+  /** Tokens leased per Redis round-trip (clamped to burst capacity). */
+  batchFor(rule) {
+    const batch = rule.batchSize;
+    if (batch === void 0 || batch <= 1) return 1;
+    return Math.min(Math.floor(batch), Math.floor(rule.capacity), 1e3);
+  }
+  /** EVALSHA first (pre-loaded script), EVAL fallback on NOSCRIPT. */
+  async runScript(redisKey, rule, requested) {
+    const args = [
+      redisKey,
+      rule.capacity,
+      rule.refillPerSecond,
+      requested
+    ];
+    if (this.redis?.evalSha) {
+      try {
+        return await withTimeout(
+          this.redis.evalSha(TOKEN_BUCKET_SHA1, 1, ...args),
+          this.timeoutMs
+        );
+      } catch (err) {
+        if (!isNoScriptError(err)) throw err;
+      }
+    }
+    return withTimeout(
+      this.redis.eval(TOKEN_BUCKET_SCRIPT, 1, ...args),
+      this.timeoutMs
+    );
+  }
+  setBatchCredit(redisKey, credits) {
+    this.batchCredits.set(redisKey, credits);
   }
   /** Bulk pre-check used by adapters that want headers before deciding. */
   async check(key, rule) {
@@ -449,7 +776,8 @@ var RedisRateLimiter = class {
           remaining: rule.capacity,
           limit: rule.capacity,
           resetAt: Math.ceil(Date.now() / 1e3) + 1,
-          retryAfterMs: 0
+          retryAfterMs: 0,
+          source: "fail-open"
         };
       case FAIL_MODES.closed:
         return {
@@ -457,11 +785,12 @@ var RedisRateLimiter = class {
           remaining: 0,
           limit: rule.capacity,
           resetAt: Math.ceil(Date.now() / 1e3) + 1,
-          retryAfterMs: this.timeoutMs
+          retryAfterMs: this.timeoutMs,
+          source: "fail-closed"
         };
       case FAIL_MODES.fallback:
       default:
-        return this.local.consume(key, rule);
+        return { ...this.local.consume(key, rule), source: "local-fallback" };
     }
   }
   parseResult(raw, rule) {
@@ -485,9 +814,12 @@ var RedisRateLimiter = class {
 
 // src/limiter/InMemoryRedis.ts
 var InMemoryRedis = class {
-  buckets = /* @__PURE__ */ new Map();
-  kv = /* @__PURE__ */ new Map();
-  maxKeys = DEFAULTS.inMemoryRedis.maxKeys;
+  buckets = new BoundedMap({
+    maxEntries: DEFAULTS.inMemoryRedis.maxKeys
+  });
+  kv = new BoundedMap({
+    maxEntries: DEFAULTS.inMemoryRedis.maxKeys
+  });
   async eval(_script, _numKeys, ...args) {
     const key = String(args[0]);
     const capacity = Number(args[1]);
@@ -496,10 +828,6 @@ var InMemoryRedis = class {
     const now = Date.now() / 1e3;
     let bucket = this.buckets.get(key);
     if (bucket === void 0) {
-      if (this.buckets.size >= this.maxKeys) {
-        const oldest = this.buckets.keys().next();
-        if (!oldest.done) this.buckets.delete(oldest.value);
-      }
       bucket = { tokens: capacity, ts: now };
       this.buckets.set(key, bucket);
     }
@@ -516,85 +844,375 @@ var InMemoryRedis = class {
     }
     return [allowed, bucket.tokens, capacity, now, retry];
   }
+  /** In-memory EVALSHA — script text is irrelevant; semantics match eval. */
+  async evalSha(_sha1, numKeys, ...args) {
+    return this.eval("", numKeys, ...args);
+  }
   async ping() {
     return "PONG";
   }
   async get(key) {
-    const entry = this.kv.get(key);
-    if (!entry) return null;
-    if (entry.expiresAt !== void 0 && entry.expiresAt <= Date.now()) {
-      this.kv.delete(key);
-      return null;
-    }
-    return entry.value;
+    return this.kv.get(key) ?? null;
   }
   async set(key, value, ...args) {
-    let expiresAt;
+    let pxMs;
+    let nx = false;
     for (let i = 0; i < args.length; i += 1) {
-      if (String(args[i]).toUpperCase() === "PX") {
+      const flag = String(args[i]).toUpperCase();
+      if (flag === "PX") {
         const ms = Number(args[i + 1]);
-        if (Number.isFinite(ms)) expiresAt = Date.now() + ms;
+        if (Number.isFinite(ms)) pxMs = ms;
         i += 1;
+      } else if (flag === "NX") {
+        nx = true;
       }
     }
-    if (this.kv.size >= this.maxKeys && !this.kv.has(key)) {
-      const oldest = this.kv.keys().next();
-      if (!oldest.done) this.kv.delete(oldest.value);
-    }
-    this.kv.set(key, expiresAt === void 0 ? { value } : { value, expiresAt });
+    if (nx && this.kv.get(key) !== void 0) return null;
+    this.kv.set(key, value, pxMs);
     return "OK";
   }
   async del(key) {
     return this.kv.delete(key) ? 1 : 0;
   }
   async incr(key) {
-    const current = Number(await this.get(key) ?? "0");
+    const current = Number(this.kv.get(key) ?? "0");
     const next = current + 1;
-    const entry = this.kv.get(key);
-    const expiresAt = entry?.expiresAt;
-    this.kv.set(key, expiresAt === void 0 ? { value: String(next) } : { value: String(next), expiresAt });
+    const ttl = this.kv.ttlRemainingMs(key);
+    this.kv.set(key, String(next), ttl);
     return next;
   }
   async expire(key, seconds) {
-    const entry = this.kv.get(key);
-    if (!entry) return 0;
-    entry.expiresAt = Date.now() + seconds * 1e3;
-    return 1;
+    return this.kv.expire(key, seconds * 1e3) ? 1 : 0;
   }
 };
 
+// src/utils/store.ts
+async function storeGet(store, key) {
+  if (store.get) return store.get(key);
+  const raw = await store.eval('return redis.call("GET", KEYS[1])', 1, key);
+  return typeof raw === "string" ? raw : null;
+}
+async function storeSet(store, key, value, pxMs) {
+  if (store.set) {
+    return pxMs === void 0 ? store.set(key, value) : store.set(key, value, "PX", pxMs);
+  }
+  if (pxMs === void 0) {
+    return store.eval('redis.call("SET", KEYS[1], ARGV[1]); return 1', 1, key, value);
+  }
+  return store.eval(
+    'redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2]); return 1',
+    1,
+    key,
+    value,
+    pxMs
+  );
+}
+async function storeSetNX(store, key, value, pxMs) {
+  if (store.set) {
+    const res = await store.set(key, value, "PX", pxMs, "NX");
+    return res === "OK";
+  }
+  const raw = await store.eval(
+    'local r = redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2], "NX"); return r and 1 or 0',
+    1,
+    key,
+    value,
+    pxMs
+  );
+  return Number(raw) === 1;
+}
+async function storeDel(store, key) {
+  if (store.del) {
+    await store.del(key);
+    return;
+  }
+  await store.eval('return redis.call("DEL", KEYS[1])', 1, key);
+}
+
 // src/cache/ResponseCache.ts
 var ResponseCache = class {
-  map = /* @__PURE__ */ new Map();
+  map;
   ttlMs;
-  maxEntries;
   now;
-  constructor(ttlMs, maxEntries = DEFAULTS.cache.maxEntries, now = Date.now) {
+  store;
+  l2Prefix;
+  constructor(ttlMs, maxEntries = DEFAULTS.cache.maxEntries, now = Date.now, store, l2Prefix = DEFAULTS.resilience.l2KeyPrefix) {
     this.ttlMs = ttlMs;
-    this.maxEntries = maxEntries;
     this.now = now;
+    this.map = new BoundedMap({
+      maxEntries,
+      mode: "lru",
+      now
+    });
+    this.store = store;
+    this.l2Prefix = l2Prefix;
   }
+  /** Synchronous L1-only lookup (hot path). */
   lookup(key) {
     const entry = this.map.get(key);
     if (entry === void 0) return {};
-    this.map.delete(key);
-    this.map.set(key, entry);
-    return this.now() - entry.storedAt <= this.ttlMs ? { fresh: entry, stale: entry } : { stale: entry };
+    return this.freshness(entry);
+  }
+  /**
+   * L1 → L2 lookup. On L2 hit the entry is hydrated into L1.
+   * Falls back to L1-only behavior when no store is configured.
+   */
+  async lookupShared(key) {
+    const local = this.lookup(key);
+    if (local.fresh || local.stale) return local;
+    if (!this.store) return local;
+    const raw = await storeGet(this.store, this.l2Key(key));
+    if (!raw) return local;
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      return local;
+    }
+    if (typeof payload.storedAt !== "number" || typeof payload.body !== "string") {
+      return local;
+    }
+    const entry = {
+      statusCode: payload.statusCode,
+      headers: payload.headers ?? {},
+      body: Buffer.from(payload.body, "base64"),
+      storedAt: payload.storedAt
+    };
+    this.setLocal(key, entry);
+    return this.freshness(entry);
+  }
+  /** L2-only read — used by cross-node coalescing followers. */
+  async lookupL2(key) {
+    if (!this.store) return {};
+    const raw = await storeGet(this.store, this.l2Key(key));
+    if (!raw) return {};
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      return {};
+    }
+    if (typeof payload.storedAt !== "number" || typeof payload.body !== "string") {
+      return {};
+    }
+    const entry = {
+      statusCode: payload.statusCode,
+      headers: payload.headers ?? {},
+      body: Buffer.from(payload.body, "base64"),
+      storedAt: payload.storedAt
+    };
+    return this.freshness(entry);
   }
   set(key, entry) {
-    this.map.delete(key);
-    this.map.set(key, { ...entry, storedAt: this.now() });
-    while (this.map.size > this.maxEntries) {
-      const oldest = this.map.keys().next();
-      if (oldest.done) break;
-      this.map.delete(oldest.value);
-    }
+    this.setLocal(key, { ...entry, storedAt: this.now() });
+  }
+  /** L1 + L2 populate. L2 retention covers the stale window. */
+  async setShared(key, entry) {
+    const full = { ...entry, storedAt: this.now() };
+    this.setLocal(key, full);
+    if (!this.store) return;
+    const payload = {
+      statusCode: full.statusCode,
+      headers: full.headers,
+      body: full.body.toString("base64"),
+      storedAt: full.storedAt
+    };
+    const retention = this.ttlMs * DEFAULTS.resilience.l2StaleRetentionFactor;
+    await storeSet(this.store, this.l2Key(key), JSON.stringify(payload), retention).catch(
+      () => void 0
+    );
+  }
+  freshness(entry) {
+    return this.now() - entry.storedAt <= this.ttlMs ? { fresh: entry, stale: entry } : { stale: entry };
+  }
+  setLocal(key, entry) {
+    this.map.set(key, entry);
+  }
+  l2Key(key) {
+    return `${this.l2Prefix}${key}`;
   }
   get size() {
     return this.map.size;
   }
   clear() {
     this.map.clear();
+  }
+};
+
+// src/cache/RequestCoalescer.ts
+var import_node_crypto2 = require("crypto");
+var RequestCoalescer = class {
+  inflight;
+  store;
+  leaseMs;
+  waitMs;
+  pollMs;
+  nodeId;
+  constructor(store, options = {}) {
+    this.store = store;
+    this.inflight = new BoundedMap({
+      maxEntries: options.maxInflight ?? DEFAULTS.cache.maxEntries
+    });
+    this.leaseMs = options.leaseMs ?? DEFAULTS.resilience.coalesceLeaseMs;
+    this.waitMs = options.waitMs ?? DEFAULTS.resilience.coalesceWaitMs;
+    this.pollMs = options.pollMs ?? DEFAULTS.resilience.coalescePollMs;
+    this.nodeId = options.nodeId ?? (0, import_node_crypto2.randomUUID)();
+  }
+  /** Existing in-flight upstream fetch for this key, if any. */
+  get(key) {
+    return this.inflight.get(key);
+  }
+  set(key, promise) {
+    this.inflight.set(key, promise);
+  }
+  delete(key) {
+    this.inflight.delete(key);
+  }
+  leaseKey(key) {
+    return `${DEFAULTS.resilience.leaseKeyPrefix}${key}`;
+  }
+  /**
+   * Try to become the cross-node leader for this cache key.
+   * Returns false when another node holds the lease.
+   */
+  async acquireLease(key) {
+    if (!this.store) return true;
+    return storeSetNX(
+      this.store,
+      this.leaseKey(key),
+      this.nodeId,
+      this.leaseMs
+    );
+  }
+  async releaseLease(key) {
+    if (!this.store) return;
+    await storeDel(this.store, this.leaseKey(key)).catch(() => void 0);
+  }
+  /**
+   * Follower path: poll the shared L2 cache until an entry appears or
+   * the wait budget expires. Returns the fresh entry or null.
+   */
+  async waitForShared(key, readL2) {
+    if (!this.store) return null;
+    const deadline = Date.now() + this.waitMs;
+    while (Date.now() < deadline) {
+      await sleep(this.pollMs);
+      const { fresh, stale } = await readL2();
+      const entry = fresh ?? stale;
+      if (entry) return entry;
+    }
+    return null;
+  }
+};
+
+// src/resilience/IdempotencyManager.ts
+var import_node_crypto3 = require("crypto");
+var HOP = HOP_BY_HOP_SET;
+var REPLAY_EXCLUDED = /* @__PURE__ */ new Set(["x-idempotent-replay"]);
+function jittered(ms) {
+  return ms + Math.floor(Math.random() * ms);
+}
+var IdempotencyManager = class {
+  store;
+  nodeId;
+  constructor(store, nodeId = (0, import_node_crypto3.randomUUID)()) {
+    this.store = store;
+    this.nodeId = nodeId;
+  }
+  keyFor(scope, idempotencyKey) {
+    return `${DEFAULTS.resilience.idempotencyKeyPrefix}${scope}|${idempotencyKey}`;
+  }
+  fingerprint(method, url, rawBody) {
+    return (0, import_node_crypto3.createHash)("sha256").update(method.toUpperCase()).update(" ").update(url).update("\n").update(rawBody).digest("hex");
+  }
+  /**
+   * Attempt to begin an idempotent operation.
+   * Returns 'proceed' with complete/abort callbacks when the lock is
+   * acquired, a replay/conflict/mismatch decision otherwise.
+   */
+  async begin(scope, idempotencyKey, fingerprint, options) {
+    const key = this.keyFor(scope, idempotencyKey);
+    const deadline = Date.now() + options.lockTimeoutMs;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const locked = await storeSetNX(
+        this.store,
+        key,
+        JSON.stringify({ state: "IN_PROGRESS", fingerprint, node: this.nodeId }),
+        options.lockTimeoutMs
+      );
+      if (locked) {
+        return {
+          action: "proceed",
+          complete: (result) => this.complete(key, fingerprint, result, options.ttlMs),
+          abort: () => storeDel(this.store, key).then(() => void 0)
+        };
+      }
+      const raw = await storeGet(this.store, key);
+      if (raw === null) continue;
+      let state;
+      try {
+        state = JSON.parse(raw);
+      } catch {
+        await storeDel(this.store, key);
+        continue;
+      }
+      if (state.state === "COMPLETED") {
+        if (state.fingerprint !== fingerprint) {
+          return { action: "fingerprint-mismatch" };
+        }
+        return {
+          action: "replay",
+          statusCode: state.statusCode ?? STATUS.ok,
+          headers: state.headers ?? {},
+          body: Buffer.from(state.body ?? "", "base64")
+        };
+      }
+      return this.pollForCompletion(key, fingerprint, deadline);
+    }
+    return { action: "conflict" };
+  }
+  async pollForCompletion(key, fingerprint, deadline) {
+    while (Date.now() < deadline) {
+      await sleep(jittered(50));
+      const raw = await storeGet(this.store, key);
+      if (raw === null) {
+        return { action: "conflict" };
+      }
+      let state;
+      try {
+        state = JSON.parse(raw);
+      } catch {
+        return { action: "conflict" };
+      }
+      if (state.state === "COMPLETED") {
+        if (state.fingerprint !== fingerprint) {
+          return { action: "fingerprint-mismatch" };
+        }
+        return {
+          action: "replay",
+          statusCode: state.statusCode ?? STATUS.ok,
+          headers: state.headers ?? {},
+          body: Buffer.from(state.body ?? "", "base64")
+        };
+      }
+    }
+    return { action: "conflict" };
+  }
+  async complete(key, fingerprint, result, ttlMs) {
+    const headers = {};
+    for (const [name, value] of Object.entries(result.headers)) {
+      const lower = name.toLowerCase();
+      if (HOP.has(lower) || REPLAY_EXCLUDED.has(lower) || value === void 0) continue;
+      headers[lower] = Array.isArray(value) ? value.join(", ") : value;
+    }
+    const stored = {
+      state: "COMPLETED",
+      fingerprint,
+      statusCode: result.statusCode,
+      headers,
+      body: result.body.toString("base64")
+    };
+    await storeSet(this.store, key, JSON.stringify(stored), ttlMs);
   }
 };
 
@@ -615,7 +1233,6 @@ var DURATION_UNIT_MS = {
   h: 36e5,
   d: 864e5
 };
-var UPSTREAM_RE = /^https?:\/\/\S+$/;
 function parseRateLimit(input) {
   if (typeof input !== "string") return input;
   const match = RATE_LIMIT_RE.exec(input);
@@ -654,7 +1271,7 @@ function parseDurationMs(input) {
   }
   return Math.round(value * unitMs);
 }
-function parseCache(input) {
+function parseCacheInput(input) {
   if (typeof input === "object") return input;
   return { ttlMs: parseDurationMs(input) };
 }
@@ -667,26 +1284,26 @@ function normalizePrefix(path2) {
   return path2 === "" ? "/" : path2;
 }
 function toTargets(to) {
-  const list = Array.isArray(to) ? to : [to];
-  if (list.length === 0) throw new Error("[gateway] Route requires at least one upstream.");
-  const targets = list.map((url) => {
-    if (!UPSTREAM_RE.test(url)) {
-      throw new Error(`[gateway] Invalid upstream URL "${url}" \u2014 must start with http:// or https://.`);
-    }
-    return { url };
-  });
-  return targets;
+  return toUpstreamTargets(to);
 }
 function buildRoute(def) {
   const route2 = {
     prefix: normalizePrefix(def.path),
     upstreams: toTargets(def.to)
   };
-  if (def.auth !== void 0) route2.auth = def.auth;
+  if (def.guards !== void 0) route2.guards = def.guards;
+  if (def.stripHeaders !== void 0) route2.stripHeaders = def.stripHeaders;
   if (def.rateLimit !== void 0) route2.rateLimit = parseRateLimit(def.rateLimit);
-  if (def.cache !== void 0) route2.cache = parseCache(def.cache);
+  if (def.cache !== void 0) route2.cache = parseCacheInput(def.cache);
   if (def.stripPrefix !== void 0) route2.stripPrefix = def.stripPrefix;
-  if (def.circuitBreaker !== void 0) route2.circuitBreaker = def.circuitBreaker;
+  if (def.circuitBreaker !== void 0) {
+    const { openDurationMs, ...rest } = def.circuitBreaker;
+    const cb = { ...rest };
+    if (openDurationMs !== void 0) {
+      cb.openDurationMs = parseDurationMs(openDurationMs);
+    }
+    route2.circuitBreaker = cb;
+  }
   if (def.extractClientKey !== void 0) route2.extractClientKey = def.extractClientKey;
   return route2;
 }
@@ -698,7 +1315,7 @@ function route(path2, to, options = {}) {
 
 // src/routing/RouteLoader.ts
 var SYNC_EXTENSIONS = /* @__PURE__ */ new Set([".js", ".cjs"]);
-var UPSTREAM_RE2 = /^https?:\/\/\S+$/;
+var UPSTREAM_RE = /^https?:\/\/\S+$/;
 function fail(file, message) {
   throw new Error(`[gateway] Route load error in ${file}: ${message}`);
 }
@@ -758,13 +1375,16 @@ function normalizeRaw(raw, file) {
   }
   const list = Array.isArray(to) ? to : [to];
   for (const url of list) {
-    if (typeof url !== "string" || !UPSTREAM_RE2.test(url)) {
+    if (typeof url !== "string" || !UPSTREAM_RE.test(url)) {
       fail(file, `route "${pathValue}" has invalid upstream "${String(url)}"`);
     }
   }
   const def = { path: pathValue, to };
   const opts = {};
-  if (r.auth !== void 0) opts.auth = r.auth;
+  if (r.guards !== void 0) opts.guards = r.guards;
+  if (r.stripHeaders !== void 0) {
+    opts.stripHeaders = r.stripHeaders;
+  }
   if (r.rateLimit !== void 0) {
     opts.rateLimit = r.rateLimit;
   }
@@ -811,152 +1431,145 @@ function loadRoutesDirSync(dir) {
   );
 }
 
-// src/auth/providers.ts
-var import_node_crypto2 = require("crypto");
-
-// src/auth/jwt.ts
-var import_node_crypto = require("crypto");
-var fromB64url = (input) => Buffer.from(input, "base64url");
-function sign(data, secret) {
-  return (0, import_node_crypto.createHmac)("sha256", secret).update(data).digest("base64url");
-}
-function audienceMatches(aud, expected) {
-  if (aud === void 0) return false;
-  const expectedList = Array.isArray(expected) ? expected : [expected];
-  const actualList = Array.isArray(aud) ? aud : [aud];
-  return expectedList.some((e) => actualList.includes(e));
-}
-function verifyJwt(token, secret, options = {}) {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [header, payload, signature] = parts;
-  let alg;
-  try {
-    alg = JSON.parse(fromB64url(header).toString("utf8")).alg;
-  } catch {
-    return null;
+// src/routing/normalize.ts
+function normalizeRateLimit(input) {
+  if (typeof input === "string") {
+    return parseRateLimit(input);
   }
-  if (alg !== "HS256") return null;
-  const expected = sign(`${header}.${payload}`, secret);
-  const sigBuf = fromB64url(signature);
-  const expBuf = fromB64url(expected);
-  if (sigBuf.length !== expBuf.length || !(0, import_node_crypto.timingSafeEqual)(sigBuf, expBuf)) {
-    return null;
-  }
-  let claims;
-  try {
-    claims = JSON.parse(fromB64url(payload).toString("utf8"));
-  } catch {
-    return null;
-  }
-  const nowSec = (options.now ?? (() => Date.now() / 1e3))();
-  const leeway = options.clockToleranceSec ?? DEFAULTS.auth.jwtLeewaySec;
-  if (typeof claims.exp === "number" && claims.exp + leeway < nowSec) return null;
-  if (typeof claims.nbf === "number" && claims.nbf - leeway > nowSec) return null;
-  if (options.issuer !== void 0 && claims.iss !== options.issuer) return null;
-  if (options.audience !== void 0 && !audienceMatches(claims.aud, options.audience)) return null;
-  return claims;
-}
-
-// src/auth/providers.ts
-function bearerToken(req) {
-  const auth = getHeaderString(req, HEADERS.authorization);
-  if (!auth) return null;
-  const [scheme, token] = auth.split(" ", 2);
-  if (scheme?.toLowerCase() !== "bearer" || !token) return null;
-  return token.trim();
-}
-function isRecord(v) {
-  return typeof v === "object" && v !== null;
-}
-function toRoles(value) {
-  if (typeof value === "string") return [value];
-  if (Array.isArray(value)) {
-    return value.filter((r) => typeof r === "string");
-  }
-  return [];
-}
-function resolveClaim(claims, path2) {
-  let current = claims;
-  for (const segment of path2.split(".")) {
-    if (!isRecord(current)) return void 0;
-    current = current[segment];
-  }
-  return current;
-}
-function identityFromClaims(claims, options = {}) {
-  const userIdPath = options.userIdClaim ?? "sub";
-  const rawUserId = resolveClaim(claims, userIdPath);
-  const userId = typeof rawUserId === "string" ? rawUserId : typeof claims.userId === "string" ? claims.userId : void 0;
-  if (!userId) return null;
-  let roles;
-  if (options.roleClaim !== void 0) {
-    roles = toRoles(resolveClaim(claims, options.roleClaim));
-  } else {
-    roles = Array.isArray(claims.roles) ? claims.roles.filter((r) => typeof r === "string") : typeof claims.role === "string" ? [claims.role] : [];
-  }
-  return { userId, roles };
-}
-function createJwtProvider(config) {
-  return {
-    name: "jwt-hs256",
-    async authenticate(req) {
-      const token = bearerToken(req);
-      if (!token) return { skip: true };
-      const claims = verifyJwt(token, config.secret, {
-        ...config.issuer !== void 0 ? { issuer: config.issuer } : {},
-        ...config.audience !== void 0 ? { audience: config.audience } : {},
-        ...config.clockToleranceSec !== void 0 ? { clockToleranceSec: config.clockToleranceSec } : {}
-      });
-      if (!claims) {
-        return { authenticated: false, reason: "invalid or expired token" };
-      }
-      const identity = identityFromClaims(claims);
-      if (!identity) {
-        return { authenticated: false, reason: "token missing user id claim" };
-      }
-      return { authenticated: true, identity };
+  if (typeof input === "object" && input !== null) {
+    const rule = input;
+    if (typeof rule.capacity === "number" && Number.isFinite(rule.capacity) && rule.capacity > 0 && typeof rule.refillPerSecond === "number" && Number.isFinite(rule.refillPerSecond) && rule.refillPerSecond > 0) {
+      return rule;
     }
+  }
+  throw new Error(
+    "[gateway] invalid rateLimit \u2014 expected a RateLimitRule or a string like '600/min'."
+  );
+}
+function normalizeCache(input) {
+  if (typeof input === "number") return parseCacheInput(input);
+  if (typeof input === "string") {
+    return parseCacheInput(input);
+  }
+  if (typeof input === "object" && input !== null) {
+    return parseCacheInput(input);
+  }
+  throw new Error("[gateway] invalid cache \u2014 expected ttl ms, '30s', or RouteCacheConfig.");
+}
+function normalizeCircuitBreaker(input) {
+  if (input === void 0) return void 0;
+  if (typeof input !== "object" || input === null) {
+    throw new Error("[gateway] invalid circuitBreaker \u2014 expected an options object.");
+  }
+  const { openDurationMs, ...rest } = input;
+  const cb = { ...rest };
+  if (openDurationMs !== void 0) {
+    cb.openDurationMs = parseDurationMs(openDurationMs);
+  }
+  return cb;
+}
+function normalizeRoute(item) {
+  const raw = item;
+  const pathValue = raw.path ?? raw.prefix;
+  if (typeof pathValue !== "string" || pathValue.length === 0) {
+    throw new Error("[gateway] route requires a 'prefix' or 'path' starting with '/'.");
+  }
+  const upstreamInput = raw.upstreams ?? raw.to;
+  if (upstreamInput === void 0) {
+    throw new Error("[gateway] route requires 'upstreams' or 'to'.");
+  }
+  const {
+    prefix: _p,
+    path: _pa,
+    upstreams: _u,
+    to: _t,
+    rateLimit: _r,
+    circuitBreaker: _c,
+    cache: _ca,
+    ...rest
+  } = raw;
+  const route2 = {
+    prefix: asRoutePrefix(normalizePrefix(pathValue)),
+    upstreams: toUpstreamTargets(upstreamInput),
+    ...rest
   };
+  if (raw.rateLimit !== void 0) route2.rateLimit = normalizeRateLimit(raw.rateLimit);
+  const cb = normalizeCircuitBreaker(raw.circuitBreaker);
+  if (cb !== void 0) route2.circuitBreaker = cb;
+  if (raw.cache !== void 0) route2.cache = normalizeCache(raw.cache);
+  return route2;
 }
-
-// src/security/ApiKeyGuard.ts
-var import_node_crypto3 = require("crypto");
-function hashApiKey(rawKey) {
-  return (0, import_node_crypto3.createHash)("sha256").update(rawKey, "utf8").digest("hex");
+function normalizeRoutes(input) {
+  if (input === void 0) return void 0;
+  if (typeof input !== "object" || input === null) {
+    throw new Error("[gateway] routes must be an array or an object map.");
+  }
+  if (Array.isArray(input)) {
+    return input.map((item) => normalizeRoute(item));
+  }
+  const map = input;
+  return Object.entries(map).map(
+    ([prefix, to]) => normalizeRoute({ prefix, upstreams: to })
+  );
 }
-var ApiKeyGuard = class {
-  provider;
-  headerName;
-  constructor(config) {
-    this.provider = config.provider;
-    this.headerName = config.headerName ?? HEADERS.apiKeyHeader;
+function applyBasePrefix(routes, basePrefix) {
+  if (basePrefix === void 0) return [...routes];
+  const base = normalizePrefix(basePrefix);
+  if (base === "/") return [...routes];
+  return routes.map((r) => {
+    const prefix = String(r.prefix);
+    const joined = prefix === "/" ? base : `${base}${prefix}`;
+    return { ...r, prefix: asRoutePrefix(joined) };
+  });
+}
+var DEFAULT_ENV_PREFIX = "GATEWAY_";
+function autoRoutesFromEnv(config) {
+  if (config === void 0) return [];
+  const env = config.env ?? process.env;
+  const envPrefix = config.envPrefix ?? DEFAULT_ENV_PREFIX;
+  const out = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (value === void 0 || value === "") continue;
+    if (!key.startsWith(envPrefix)) continue;
+    const suffix = key.slice(envPrefix.length).toLowerCase().replace(/_+/g, "-").replace(/^-+|-+$/g, "");
+    if (suffix === "") continue;
+    out.push(
+      normalizeRoute({ prefix: `/${suffix}`, upstreams: value })
+    );
   }
-  /** Returns the raw key if present on the request. */
-  extractKey(req) {
-    const value = getHeaderString(req, this.headerName);
-    return value && value.length > 0 ? value : void 0;
-  }
-  /**
-   * Authenticate the request's API key against the route's required scopes.
-   * Only invoked for routes that declare `requiredScopes`.
-   */
-  async authenticate(req, route2) {
-    const raw = this.extractKey(req);
-    if (!raw) return { ok: false, reason: "missing" };
-    const record = await this.provider.resolveByHash(hashApiKey(raw));
-    if (!record) return { ok: false, reason: "invalid" };
-    if (record.expiresAtMs !== void 0 && record.expiresAtMs <= Date.now()) {
-      return { ok: false, reason: "expired" };
+  return out;
+}
+function assembleRoutes(input) {
+  const explicit = normalizeRoutes(input.routes) ?? [...input.dirRoutes ?? []];
+  const routes = [...explicit, ...autoRoutesFromEnv(input.autoRoutes)];
+  if (routes.length === 0 && input.target !== void 0) {
+    const def = {
+      prefix: "/",
+      upstreams: input.target
+    };
+    if (input.rateLimit !== void 0) def.rateLimit = input.rateLimit;
+    if (input.circuitBreaker !== void 0) {
+      def.circuitBreaker = input.circuitBreaker;
     }
-    const required = route2.requiredScopes ?? [];
-    if (required.length > 0) {
-      const hasAll = required.every((scope) => record.scopes.includes(scope));
-      if (!hasAll) return { ok: false, reason: "forbidden" };
-    }
-    return { ok: true, record };
+    if (input.cache !== void 0) def.cache = input.cache;
+    routes.push(normalizeRoute(def));
   }
-};
+  return applyBasePrefix(routes, input.basePrefix);
+}
+var RELOAD_OPTION_KEYS = /* @__PURE__ */ new Set([
+  "routes",
+  "target",
+  "rateLimit",
+  "circuitBreaker",
+  "cache",
+  "autoRoutes"
+]);
+function isRouteReloadConfig(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  return Object.keys(value).some((k) => RELOAD_OPTION_KEYS.has(k));
+}
 
 // src/security/BruteForceGuard.ts
 var FAIL_PREFIX = DEFAULTS.perimeter.bruteForceKeyPrefix;
@@ -1081,11 +1694,22 @@ function assertNoMetadataUpstreams(urls, allowMetadata) {
     }
   }
 }
+var MAX_DECODE_PASSES = 3;
 function isPathTraversal(pathname) {
-  return TRAVERSAL_RE.test(pathname);
-}
-function sanitizeHeaderValue(value) {
-  return value.replace(/[\r\n]+/g, "");
+  if (TRAVERSAL_RE.test(pathname)) return true;
+  let current = pathname;
+  for (let i = 0; i < MAX_DECODE_PASSES; i += 1) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      return true;
+    }
+    if (decoded === current) return false;
+    if (TRAVERSAL_RE.test(decoded)) return true;
+    current = decoded;
+  }
+  return TRAVERSAL_RE.test(current);
 }
 function contentTypeAllowed(req, allowed) {
   const method = req.method ?? "GET";
@@ -1093,7 +1717,7 @@ function contentTypeAllowed(req, allowed) {
   const contentType = getHeaderString(req, "content-type");
   if (!contentType) return false;
   const mime = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
-  return allowed.some((a) => a.toLowerCase() === mime);
+  return allowed.has(mime);
 }
 function isOriginAllowed(cors, origin) {
   if (cors.origins === "*") return true;
@@ -1139,9 +1763,16 @@ var CircuitBreaker = class {
   defaults;
   overrides = /* @__PURE__ */ new Map();
   now;
+  store;
+  nodeId = "local";
   constructor(defaults = {}, now = Date.now) {
     this.defaults = { ...DEFAULTS.circuitBreaker, ...defaults };
     this.now = now;
+  }
+  /** Attach a shared store for cross-node OPEN propagation + probe leases. */
+  setDistributedStore(store, nodeId) {
+    this.store = store;
+    this.nodeId = nodeId;
   }
   /** Register per-key option overrides (e.g. per route). */
   configure(key, options) {
@@ -1169,6 +1800,51 @@ var CircuitBreaker = class {
         return true;
     }
   }
+  /**
+   * Distributed-aware canExecute: honors OPEN markers published by peer
+   * nodes and serializes HALF_OPEN probes across the fleet via an
+   * atomic NX lease. Falls back to local behavior without a store.
+   */
+  async canExecuteShared(key) {
+    if (this.store) {
+      const marker = await storeGet(this.store, this.openKey(key));
+      if (marker !== null) {
+        let openedAt = this.now();
+        try {
+          openedAt = JSON.parse(marker).openedAt ?? openedAt;
+        } catch {
+        }
+        const state = this.getOrCreate(key);
+        if (state.state !== CIRCUIT_STATES.open) {
+          state.state = CIRCUIT_STATES.open;
+          state.openedAt = openedAt;
+          state.windowRequests = 0;
+          state.windowFailures = 0;
+        }
+        return false;
+      }
+      const local = this.states.get(key);
+      const opts = this.optionsFor(key);
+      const probeCandidate = local !== void 0 && (local.state === CIRCUIT_STATES.halfOpen || local.state === CIRCUIT_STATES.open && this.now() - local.openedAt >= opts.openDurationMs);
+      if (probeCandidate) {
+        const leased = await storeSetNX(
+          this.store,
+          this.probeKey(key),
+          this.nodeId,
+          Math.min(opts.openDurationMs, 3e4)
+        );
+        if (!leased) return false;
+      }
+    }
+    return this.canExecute(key);
+  }
+  /** State including peer-published OPEN markers. */
+  async stateOfShared(key) {
+    const local = this.stateOf(key);
+    if (local === CIRCUIT_STATES.open || !this.store) return local;
+    const marker = await storeGet(this.store, this.openKey(key));
+    return marker !== null ? CIRCUIT_STATES.open : local;
+  }
   recordSuccess(key) {
     const state = this.getOrCreate(key);
     const opts = this.optionsFor(key);
@@ -1181,6 +1857,7 @@ var CircuitBreaker = class {
         state.consecutiveSuccesses = 0;
         state.windowRequests = 0;
         state.windowFailures = 0;
+        this.releaseDistributed(key);
       }
       return;
     }
@@ -1193,7 +1870,7 @@ var CircuitBreaker = class {
     if (state.state === CIRCUIT_STATES.halfOpen) {
       state.halfOpenInFlight = Math.max(0, state.halfOpenInFlight - 1);
       state.consecutiveFailures = opts.failureThreshold;
-      this.open(state);
+      this.open(key, state, opts.openDurationMs);
       return;
     }
     state.consecutiveFailures += 1;
@@ -1202,18 +1879,39 @@ var CircuitBreaker = class {
     const minReq = opts.minimumRequests ?? 0;
     const ratioTripped = ratio !== void 0 && state.windowRequests >= minReq && state.windowFailures / Math.max(1, state.windowRequests) >= ratio;
     if (ratio !== void 0) {
-      if (ratioTripped) this.open(state);
+      if (ratioTripped) this.open(key, state, opts.openDurationMs);
       return;
     }
     if (state.consecutiveFailures >= opts.failureThreshold) {
-      this.open(state);
+      this.open(key, state, opts.openDurationMs);
     }
   }
-  open(state) {
+  open(key, state, openDurationMs) {
     state.state = CIRCUIT_STATES.open;
     state.openedAt = this.now();
     state.windowRequests = 0;
     state.windowFailures = 0;
+    if (this.store) {
+      const marker = { openedAt: state.openedAt };
+      void storeSet(
+        this.store,
+        this.openKey(key),
+        JSON.stringify(marker),
+        openDurationMs
+      ).catch(() => void 0);
+    }
+  }
+  /** Best-effort release of open marker + probe lease after recovery. */
+  releaseDistributed(key) {
+    if (!this.store) return;
+    void storeDel(this.store, this.openKey(key)).catch(() => void 0);
+    void storeDel(this.store, this.probeKey(key)).catch(() => void 0);
+  }
+  openKey(key) {
+    return `${DEFAULTS.resilience.cbKeyPrefix}open:${key}`;
+  }
+  probeKey(key) {
+    return `${DEFAULTS.resilience.cbKeyPrefix}probe:${key}`;
   }
   stateOf(key) {
     return this.states.get(key)?.state ?? CIRCUIT_STATES.closed;
@@ -1255,14 +1953,24 @@ function matchesPrefix(pathname, prefix) {
 }
 var Router = class {
   routes;
+  /** O(1) exact-path hits (pathname === prefix) checked before prefix scan. */
+  exact = /* @__PURE__ */ new Map();
   counters = /* @__PURE__ */ new Map();
   constructor(routes) {
     this.routes = [...routes].sort(
       (a, b) => b.prefix.length - a.prefix.length
     );
+    for (const route2 of this.routes) {
+      const key = String(route2.prefix);
+      if (!this.exact.has(key)) this.exact.set(key, route2);
+    }
   }
   resolve(req) {
     const pathname = pathnameOf(req.url);
+    const exactHit = this.exact.get(pathname);
+    if (exactHit !== void 0) {
+      return { route: exactHit, strippedPath: "/" };
+    }
     for (const route2 of this.routes) {
       const prefix = route2.prefix;
       if (matchesPrefix(pathname, prefix)) {
@@ -1296,8 +2004,8 @@ var import_node_crypto5 = require("crypto");
 
 // src/security/UpstreamSigner.ts
 var import_node_crypto4 = require("crypto");
-function signaturePayload(timestampMs, method, path2, userId, requestId) {
-  return `${timestampMs}.${method.toUpperCase()}.${path2}.${userId}.${requestId}`;
+function signaturePayload(timestampMs, method, path2, subject, requestId) {
+  return `${timestampMs}.${method.toUpperCase()}.${path2}.${subject}.${requestId}`;
 }
 function hmac(payload, secret) {
   return (0, import_node_crypto4.createHmac)("sha256", secret).update(payload).digest("hex");
@@ -1307,7 +2015,7 @@ function signGatewayRequest(input) {
   const headerName = input.headerName ?? DEFAULTS.perimeter.signatureHeader;
   const timestampHeader = input.timestampHeader ?? DEFAULTS.perimeter.signatureTimestampHeader;
   const signature = hmac(
-    signaturePayload(timestampMs, input.method, input.path, input.userId, input.requestId),
+    signaturePayload(timestampMs, input.method, input.path, input.subject, input.requestId),
     input.secret
   );
   return {
@@ -1332,14 +2040,39 @@ var PayloadTooLargeError = class extends Error {
     this.name = "PayloadTooLargeError";
   }
 };
-var HOP_BY_HOP = new Set(HOP_BY_HOP_HEADERS);
+var HOP_BY_HOP = HOP_BY_HOP_SET;
 var ProxyHandler = class {
   agents = /* @__PURE__ */ new Map();
   timeoutMs;
   maxSockets;
+  maxFreeSockets;
+  keepAliveMsecs;
   constructor(options = {}) {
     this.timeoutMs = options.timeoutMs ?? 3e4;
-    this.maxSockets = options.maxSockets ?? 256;
+    this.maxSockets = options.maxSockets ?? DEFAULTS.networking.upstreamMaxSockets;
+    this.maxFreeSockets = options.maxFreeSockets ?? DEFAULTS.networking.upstreamMaxFreeSockets;
+    this.keepAliveMsecs = options.keepAliveMsecs ?? DEFAULTS.networking.upstreamKeepAliveMsecs;
+  }
+  /** Live per-upstream-origin connection pool metrics. */
+  poolMetrics() {
+    const out = {};
+    for (const [origin, agent] of this.agents) {
+      let activeSockets = 0;
+      let freeSockets = 0;
+      for (const list of Object.values(agent.sockets)) {
+        if (list) activeSockets += list.length;
+      }
+      for (const list of Object.values(agent.freeSockets)) {
+        if (list) freeSockets += list.length;
+      }
+      const pending = agent.requests;
+      out[origin] = {
+        activeSockets,
+        freeSockets,
+        queuedRequests: Array.isArray(pending) ? pending.length : 0
+      };
+    }
+    return out;
   }
   /**
    * Forward `req` to the upstream and stream the response into `res`.
@@ -1360,7 +2093,7 @@ var ProxyHandler = class {
       const transport = isHttps ? import_node_https.default : import_node_http.default;
       const requestId = this.resolveRequestId(req, target);
       const headers = this.buildHeaders(req, url, target, requestId);
-      const agent = this.agentFor(isHttps);
+      const agent = this.agentFor(url);
       const upstreamReq = transport.request(
         {
           protocol: url.protocol,
@@ -1372,7 +2105,7 @@ var ProxyHandler = class {
           agent
         },
         (upstreamRes) => {
-          clearTimeout(timer);
+          timer.clear();
           const statusCode = upstreamRes.statusCode ?? STATUS.badGateway;
           if (options?.maskErrors === true && statusCode >= 500) {
             this.maskedResponse(upstreamRes, res, target.responseHeaders, statusCode, resolve);
@@ -1403,23 +2136,42 @@ var ProxyHandler = class {
           });
         }
       );
-      const timer = setTimeout(() => {
+      const timer = deadlineTimer(this.timeoutMs, () => {
         upstreamReq.destroy(new UpstreamTimeoutError(this.timeoutMs));
-      }, this.timeoutMs);
-      timer.unref?.();
+      });
+      upstreamReq.on("close", () => timer.clear());
       res.on("close", () => {
         if (!res.writableEnded) upstreamReq.destroy();
       });
       req.on("aborted", () => upstreamReq.destroy());
       upstreamReq.on("error", (err) => {
-        clearTimeout(timer);
+        timer.clear();
         reject(err instanceof UpstreamTimeoutError ? err : err);
       });
       req.on("error", (err) => {
-        clearTimeout(timer);
+        timer.clear();
         upstreamReq.destroy();
         reject(err);
       });
+      const onAbort = () => {
+        timer.clear();
+        upstreamReq.destroy(new Error("upstream attempt aborted"));
+      };
+      if (options?.signal) {
+        if (options.signal.aborted) {
+          onAbort();
+          return;
+        }
+        options.signal.addEventListener("abort", onAbort, { once: true });
+        upstreamReq.on(
+          "close",
+          () => options.signal?.removeEventListener("abort", onAbort)
+        );
+      }
+      if (target.bodyOverride !== void 0) {
+        upstreamReq.end(target.bodyOverride);
+        return;
+      }
       if (maxBodyBytes !== void 0) {
         let received = 0;
         req.on("data", (chunk) => {
@@ -1441,11 +2193,10 @@ var ProxyHandler = class {
   }
   buildHeaders(req, url, target, requestId) {
     const headers = {};
-    const identity = new Set(IDENTITY_HEADERS);
-    const strip = new Set(target.stripHeaders ?? []);
+    const strip = target.stripHeaders;
     for (const [name, value] of Object.entries(req.headers)) {
       if (value === void 0 || HOP_BY_HOP.has(name)) continue;
-      if (identity.has(name) || strip.has(name)) continue;
+      if (strip !== void 0 && strip.has(name)) continue;
       headers[name] = Array.isArray(value) ? value.map(sanitizeHeaderValue) : sanitizeHeaderValue(value);
     }
     headers[HEADERS.requestId] = requestId;
@@ -1453,17 +2204,20 @@ var ProxyHandler = class {
     if (clientIp) headers[HEADERS.forwardedFor] = clientIp;
     const proto = getHeaderString(req, HEADERS.forwardedProto) ?? url.protocol.replace(":", "");
     headers[HEADERS.forwardedProto] = proto;
-    if (target.identityHeaders) {
-      for (const [name, value] of Object.entries(target.identityHeaders)) {
+    if (target.guardHeaders) {
+      for (const [name, value] of Object.entries(target.guardHeaders)) {
         headers[name.toLowerCase()] = value;
       }
     }
     if (target.signing) {
+      if (target.signing.subject !== "" && target.signing.subjectHeader) {
+        headers[target.signing.subjectHeader.toLowerCase()] = target.signing.subject;
+      }
       const signed = signGatewayRequest({
         secret: target.signing.secret,
         method: req.method ?? "GET",
         path: target.path,
-        userId: target.signing.userId,
+        subject: target.signing.subject,
         requestId,
         ...target.signing.headerName !== void 0 ? { headerName: target.signing.headerName } : {},
         ...target.signing.timestampHeader !== void 0 ? { timestampHeader: target.signing.timestampHeader } : {}
@@ -1524,11 +2278,24 @@ var ProxyHandler = class {
       resolve({ statusCode: STATUS.badGateway, headers: {} });
     });
   }
-  agentFor(isHttps) {
-    const key = isHttps ? "https" : "http";
+  /**
+   * One keep-alive agent per upstream origin — tuned for high
+   * concurrency: LIFO scheduling, no-delay sockets, bounded free pool.
+   */
+  agentFor(url) {
+    const key = url.origin;
     let agent = this.agents.get(key);
     if (!agent) {
-      agent = isHttps ? new import_node_https.default.Agent({ keepAlive: true, maxSockets: this.maxSockets }) : new import_node_http.default.Agent({ keepAlive: true, maxSockets: this.maxSockets });
+      const isHttps = url.protocol === "https:";
+      const opts = {
+        keepAlive: true,
+        maxSockets: this.maxSockets,
+        maxFreeSockets: this.maxFreeSockets,
+        keepAliveMsecs: this.keepAliveMsecs,
+        scheduling: "lifo",
+        socketNoDelay: true
+      };
+      agent = isHttps ? new import_node_https.default.Agent(opts) : new import_node_http.default.Agent(opts);
       this.agents.set(key, agent);
     }
     return agent;
@@ -1546,9 +2313,351 @@ var ProxyHandler = class {
   }
 };
 
+// src/routing/LoadBalancer.ts
+var EWMA_ALPHA = 0.2;
+var LoadBalancer = class {
+  stats = /* @__PURE__ */ new Map();
+  statsFor(url) {
+    let s = this.stats.get(url);
+    if (!s) {
+      s = { inFlight: 0, ewmaMs: 0, samples: 0 };
+      this.stats.set(url, s);
+    }
+    return s;
+  }
+  enter(url) {
+    this.statsFor(url).inFlight += 1;
+  }
+  /** Record completion; latencyMs is time-to-first-byte. */
+  leave(url, latencyMs) {
+    const s = this.statsFor(url);
+    s.inFlight = Math.max(0, s.inFlight - 1);
+    s.ewmaMs = s.samples === 0 ? latencyMs : s.ewmaMs + EWMA_ALPHA * (latencyMs - s.ewmaMs);
+    s.samples += 1;
+  }
+  statsOf(url) {
+    const s = this.stats.get(url);
+    return { inFlight: s?.inFlight ?? 0, ewmaMs: s?.ewmaMs ?? 0 };
+  }
+  /** Weighted random pick of one candidate. */
+  pickWeighted(upstreams) {
+    const total = upstreams.reduce((sum, u) => sum + (u.weight ?? 1), 0);
+    let r = Math.random() * total;
+    for (const u of upstreams) {
+      r -= u.weight ?? 1;
+      if (r <= 0) return u;
+    }
+    return upstreams[0];
+  }
+  /** Lower score = less loaded (in-flight dominates, EWMA breaks ties). */
+  score(url) {
+    const s = this.stats.get(url);
+    if (!s) return 0;
+    const latencyScore = s.samples === 0 ? 5e4 : Math.round(s.ewmaMs * 1e3);
+    return s.inFlight * 1e6 + latencyScore;
+  }
+  /**
+   * Power-of-two-choices: sample two distinct weighted candidates,
+   * return the one with the lower load score.
+   */
+  selectP2C(upstreams) {
+    if (upstreams.length === 1) return upstreams[0];
+    const a = this.pickWeighted(upstreams);
+    let b = this.pickWeighted(upstreams);
+    if (b.url === a.url && upstreams.length > 1) {
+      for (let i = 0; i < 4 && b.url === a.url; i += 1) {
+        b = this.pickWeighted(upstreams);
+      }
+      if (b.url === a.url) {
+        b = upstreams.find((u) => u.url !== a.url) ?? a;
+      }
+    }
+    return this.score(a.url) <= this.score(b.url) ? a : b;
+  }
+  /** P2C pick excluding a specific upstream (hedging secondary). */
+  selectAlternative(upstreams, excludeUrl) {
+    const candidates = upstreams.filter((u) => u.url !== excludeUrl);
+    if (candidates.length === 0) return void 0;
+    return this.selectP2C(candidates);
+  }
+};
+
+// src/networking/LoadShedder.ts
+var import_node_perf_hooks = require("perf_hooks");
+var LoadShedder = class {
+  histogram = (0, import_node_perf_hooks.monitorEventLoopDelay)({
+    resolution: DEFAULTS.networking.eventLoopResolutionMs
+  });
+  maxEventLoopDelayMs;
+  maxConcurrentRequests;
+  inFlightCount = 0;
+  enabled = false;
+  constructor(options = {}) {
+    this.maxEventLoopDelayMs = options.maxEventLoopDelayMs ?? DEFAULTS.networking.maxEventLoopDelayMs;
+    this.maxConcurrentRequests = options.maxConcurrentRequests;
+  }
+  start() {
+    if (this.enabled) return;
+    this.enabled = true;
+    this.histogram.enable();
+  }
+  stop() {
+    if (!this.enabled) return;
+    this.enabled = false;
+    this.histogram.disable();
+  }
+  enter() {
+    this.inFlightCount += 1;
+  }
+  leave() {
+    this.inFlightCount = Math.max(0, this.inFlightCount - 1);
+  }
+  get inFlight() {
+    return this.inFlightCount;
+  }
+  /** p99 event-loop delay in milliseconds. */
+  eventLoopDelayP99Ms() {
+    if (!this.enabled) return 0;
+    return this.histogram.percentile(99) / 1e6;
+  }
+  shouldShed() {
+    if (this.maxConcurrentRequests !== void 0 && this.inFlightCount >= this.maxConcurrentRequests) {
+      return true;
+    }
+    return this.eventLoopDelayP99Ms() > this.maxEventLoopDelayMs;
+  }
+};
+
+// src/networking/ClusterSupervisor.ts
+var import_node_cluster = __toESM(require("cluster"), 1);
+var import_node_os = __toESM(require("os"), 1);
+var SHUTDOWN_MESSAGE = "gateway:shutdown";
+async function listenCluster(gateway, options = {}) {
+  if (import_node_cluster.default.isWorker) {
+    await gateway.listen();
+    const shutdown = () => {
+      void gateway.shutdown().finally(() => process.exit(0));
+    };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+    process.on("message", (msg) => {
+      if (msg === SHUTDOWN_MESSAGE) shutdown();
+    });
+    return;
+  }
+  const workerCount = options.workers ?? import_node_os.default.availableParallelism();
+  const respawnDelayMs = options.respawnDelayMs ?? 1e3;
+  const workers = /* @__PURE__ */ new Set();
+  let shuttingDown = false;
+  const spawn = () => {
+    if (shuttingDown) return;
+    const worker = import_node_cluster.default.fork();
+    workers.add(worker);
+    worker.on("exit", () => {
+      workers.delete(worker);
+      if (!shuttingDown) {
+        setTimeout(spawn, respawnDelayMs).unref();
+      }
+    });
+    worker.on("error", () => {
+    });
+  };
+  for (let i = 0; i < workerCount; i += 1) spawn();
+  const retire = (worker) => {
+    worker.send(SHUTDOWN_MESSAGE);
+    setTimeout(() => {
+      if (!worker.isDead?.() && workers.has(worker)) worker.kill("SIGKILL");
+    }, 15e3).unref();
+    worker.on("exit", () => workers.delete(worker));
+  };
+  process.on("SIGTERM", () => {
+    shuttingDown = true;
+    for (const w of workers) retire(w);
+    const wait = setInterval(() => {
+      if (workers.size === 0) {
+        clearInterval(wait);
+        process.exit(0);
+      }
+    }, 100);
+    wait.unref();
+  });
+  process.on("SIGINT", () => {
+    process.emit("SIGTERM");
+  });
+  process.on("SIGUSR2", () => {
+    const snapshot = [...workers];
+    for (const w of snapshot) {
+      spawn();
+      retire(w);
+    }
+  });
+  await new Promise(() => {
+  });
+}
+
+// src/core/MetricsCollector.ts
+var LATENCY_WINDOW = 512;
+function quantile(sorted, q) {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1);
+  return sorted[Math.max(0, idx)] ?? 0;
+}
+var MetricsCollector = class {
+  stats = /* @__PURE__ */ new Map();
+  statFor(routeKey) {
+    let s = this.stats.get(routeKey);
+    if (!s) {
+      s = {
+        requestsTotal: 0,
+        rateLimitedTotal: 0,
+        circuitOpenTotal: 0,
+        cacheHitTotal: 0,
+        upstreamErrorsTotal: 0,
+        latencies: new Array(LATENCY_WINDOW).fill(0),
+        latencyIndex: 0,
+        latencyFilled: false
+      };
+      this.stats.set(routeKey, s);
+    }
+    return s;
+  }
+  /** Count one completed request + observe its latency. */
+  recordRequest(route2, latencyMs) {
+    const s = this.statFor(String(route2));
+    s.requestsTotal += 1;
+    s.latencies[s.latencyIndex] = latencyMs;
+    s.latencyIndex = (s.latencyIndex + 1) % LATENCY_WINDOW;
+    if (s.latencyIndex === 0) s.latencyFilled = true;
+  }
+  /** Increment a specific outcome counter for a route. */
+  recordOutcome(route2, outcome) {
+    const s = this.statFor(String(route2));
+    switch (outcome) {
+      case "rate_limited":
+        s.rateLimitedTotal += 1;
+        break;
+      case "circuit_open":
+        s.circuitOpenTotal += 1;
+        break;
+      case "cache_hit":
+        s.cacheHitTotal += 1;
+        break;
+      case "upstream_error":
+        s.upstreamErrorsTotal += 1;
+        break;
+    }
+  }
+  /** JSON snapshot for `Accept: application/json`. */
+  snapshot() {
+    const out = {};
+    for (const [route2, s] of this.stats) {
+      const window = s.latencyFilled ? s.latencies : s.latencies.slice(0, s.latencyIndex);
+      const sorted = [...window].sort((a, b) => a - b);
+      out[route2] = {
+        requestsTotal: s.requestsTotal,
+        rateLimitedTotal: s.rateLimitedTotal,
+        circuitOpenTotal: s.circuitOpenTotal,
+        cacheHitTotal: s.cacheHitTotal,
+        upstreamErrorsTotal: s.upstreamErrorsTotal,
+        latencyMs: {
+          count: sorted.length,
+          p50: quantile(sorted, 0.5),
+          p95: quantile(sorted, 0.95),
+          p99: quantile(sorted, 0.99)
+        }
+      };
+    }
+    return out;
+  }
+  /** Prometheus exposition format (text/plain; version=0.0.4). */
+  prometheus() {
+    const lines = [];
+    for (const [route2, s] of this.stats) {
+      const label = `route="${route2.replace(/"/g, '\\"')}"`;
+      lines.push(
+        `gateway_requests_total{${label}} ${s.requestsTotal}`,
+        `gateway_rate_limited_total{${label}} ${s.rateLimitedTotal}`,
+        `gateway_circuit_open_total{${label}} ${s.circuitOpenTotal}`,
+        `gateway_cache_hit_total{${label}} ${s.cacheHitTotal}`,
+        `gateway_upstream_errors_total{${label}} ${s.upstreamErrorsTotal}`
+      );
+      const window = s.latencyFilled ? s.latencies : s.latencies.slice(0, s.latencyIndex);
+      const sorted = [...window].sort((a, b) => a - b);
+      for (const [q, name] of [
+        [0.5, "0.5"],
+        [0.95, "0.95"],
+        [0.99, "0.99"]
+      ]) {
+        lines.push(
+          `gateway_request_duration_ms{${label},quantile="${name}"} ${quantile(sorted, q).toFixed(3)}`
+        );
+      }
+    }
+    return `${lines.join("\n")}
+`;
+  }
+};
+
+// src/networking/UpgradeProxy.ts
+var import_node_http2 = require("http");
+var import_node_net = __toESM(require("net"), 1);
+var import_node_tls = __toESM(require("tls"), 1);
+var HOP_FOR_UPGRADE = hopByHopSet(["host"]);
+function buildHandshake(req, target, upstream) {
+  const lines = [
+    `${req.method ?? "GET"} ${target.path} HTTP/1.1`
+  ];
+  const strip = target.stripHeaders;
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value === void 0 || HOP_FOR_UPGRADE.has(name)) continue;
+    if (strip !== void 0 && strip.has(name)) continue;
+    const v = Array.isArray(value) ? value.map(sanitizeHeaderValue).join(", ") : sanitizeHeaderValue(value);
+    lines.push(`${name}: ${v}`);
+  }
+  lines.push(`host: ${upstream.host}`);
+  if (target.guardHeaders) {
+    for (const [name, value] of Object.entries(target.guardHeaders)) {
+      lines.push(`${name}: ${value}`);
+    }
+  }
+  const fwd = req.socket.remoteAddress;
+  if (fwd) lines.push(`${HEADERS.forwardedFor}: ${fwd}`);
+  lines.push("", "");
+  return lines.join("\r\n");
+}
+function proxyUpgrade(req, clientSocket, head, upstream, options) {
+  const url = new URL(upstream.url);
+  const isHttps = url.protocol === "https:";
+  const port = Number(url.port) || (isHttps ? 443 : 80);
+  const handshake = buildHandshake(req, options, url);
+  const timeoutMs = options.handshakeTimeoutMs ?? DEFAULTS.networking.upgradeHandshakeTimeoutMs;
+  const upstreamSocket = isHttps ? import_node_tls.default.connect({ host: url.hostname, port, servername: url.hostname }) : import_node_net.default.connect({ host: url.hostname, port });
+  upstreamSocket.setNoDelay(true);
+  clientSocket.setNoDelay(true);
+  let settled = false;
+  const timer = deadlineTimer(timeoutMs, teardown);
+  function teardown() {
+    if (settled) return;
+    settled = true;
+    timer.clear();
+    destroySafely(upstreamSocket, clientSocket);
+  }
+  upstreamSocket.on("error", teardown);
+  clientSocket.on("error", teardown);
+  upstreamSocket.on("close", () => destroySafely(clientSocket));
+  clientSocket.on("close", () => destroySafely(upstreamSocket));
+  upstreamSocket.once(isHttps ? "secureConnect" : "connect", () => {
+    timer.clear();
+    upstreamSocket.write(handshake);
+    if (head.length > 0) upstreamSocket.write(head);
+    clientSocket.pipe(upstreamSocket);
+    upstreamSocket.pipe(clientSocket);
+  });
+}
+
 // src/core/GatewayEngine.ts
 var isGatewayResponse = (v) => typeof v === "object" && v !== null && "statusCode" in v;
-var HOP_BY_HOP2 = new Set(HOP_BY_HOP_HEADERS);
+var HOP_BY_HOP2 = HOP_BY_HOP_SET;
 var CACHE_EXCLUDED_HEADERS = /* @__PURE__ */ new Set([
   HEADERS.gatewayCache,
   HEADERS.rateLimitLimit,
@@ -1556,28 +2665,20 @@ var CACHE_EXCLUDED_HEADERS = /* @__PURE__ */ new Set([
   HEADERS.rateLimitReset,
   "x-gateway"
 ]);
-function identityToHeaders(identity) {
-  if (!identity) return void 0;
-  const headers = { [HEADERS.userId]: identity.userId };
-  if (identity.roles.length > 0) headers[HEADERS.userRole] = identity.roles.join(",");
-  return headers;
-}
-function authRequired(route2) {
-  return route2.auth !== void 0 && route2.auth !== false;
-}
-function validateAuthConfig(auth, routes) {
-  if (!auth) return;
-  const needsAuth = routes.some(authRequired);
-  const hasProviders = auth.jwt !== void 0 || (auth.providers?.length ?? 0) > 0;
-  if (needsAuth && !hasProviders) {
-    throw new Error(
-      "[gateway] One or more routes set `auth`, but no auth provider is configured. Set auth.jwt, auth.providers, or use a GatewayPlugin for custom auth."
-    );
-  }
-}
 function requestForbidsCache(req) {
   const cc = getHeaderString(req, HEADERS.cacheControl)?.toLowerCase() ?? "";
   return cc.includes("no-store") || cc.includes("private");
+}
+async function readRequestBody(req, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buf = chunk;
+    size += buf.length;
+    if (size > limit) throw new PayloadTooLargeError(limit);
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
 }
 function responseForbidsCache(headers) {
   const value = headers[HEADERS.cacheControl];
@@ -1594,27 +2695,87 @@ function storableHeaders(headers) {
   return out;
 }
 function createGateway(config) {
-  const routes = config.routes ?? (config.routesDir ? loadRoutesDirSync(config.routesDir) : []);
-  validateAuthConfig(config.auth, routes);
+  const configuredRoutes = assembleRoutes({
+    routes: config.routes,
+    dirRoutes: config.routesDir ? loadRoutesDirSync(config.routesDir) : void 0,
+    target: config.target,
+    rateLimit: config.rateLimit,
+    circuitBreaker: config.circuitBreaker,
+    cache: config.cache,
+    basePrefix: config.basePrefix,
+    autoRoutes: config.autoRoutes
+  });
+  if (configuredRoutes.length === 0 && config.healthPath === void 0 && config.probes?.livenessPath === void 0 && config.probes?.readinessPath === void 0 && config.metricsPath === void 0) {
+    throw new Error(
+      "[gateway] empty route table \u2014 provide `routes`, `target`, `routesDir`, or `autoRoutes` (or a health/metrics path)."
+    );
+  }
   assertNoMetadataUpstreams(
-    routes.flatMap((r) => r.upstreams.map((u) => u.url)),
+    configuredRoutes.flatMap((r) => r.upstreams.map((u) => u.url)),
     config.allowMetadataUpstreams === true
   );
   if (config.cors) assertValidCors(config.cors);
   if (config.upstreamSigning !== void 0 && config.upstreamSigning.secret.length === 0) {
     throw new Error("[gateway] upstreamSigning.secret must not be empty.");
   }
-  const router = new Router(routes);
+  const metrics = new MetricsCollector();
+  const metricsPathKey = config.metricsPath !== void 0 ? String(config.metricsPath) : void 0;
+  const metricsPathCovered = (table) => {
+    if (metricsPathKey === void 0) return true;
+    return table.some((r) => {
+      const p = String(r.prefix);
+      return p === "/" || metricsPathKey === p || metricsPathKey.startsWith(`${p}/`);
+    });
+  };
+  const withMetricsRoute = (table) => {
+    if (metricsPathKey === void 0 || metricsPathCovered(table)) {
+      return [...table];
+    }
+    return [
+      ...table,
+      {
+        prefix: config.metricsPath,
+        // Never contacted — the pipeline serves metrics before proxying.
+        upstreams: [{ url: "http://127.0.0.1:9" }]
+      }
+    ];
+  };
+  let routeTable = withMetricsRoute(configuredRoutes);
+  let router = new Router(routeTable);
+  const globalStripHeaders = new Set(
+    (config.stripHeaders ?? []).map((h) => h.toLowerCase())
+  );
+  const preparedRoutes = /* @__PURE__ */ new Map();
+  const buildPreparedRoutes = (table) => {
+    preparedRoutes.clear();
+    for (const route2 of table) {
+      const stripHeaders = new Set(globalStripHeaders);
+      for (const h of route2.stripHeaders ?? []) stripHeaders.add(h.toLowerCase());
+      const prep = { stripHeaders };
+      if (route2.allowedContentTypes !== void 0) {
+        prep.contentTypes = new Set(
+          route2.allowedContentTypes.map((c) => c.toLowerCase())
+        );
+      }
+      const varyHeaders = route2.cache?.varyHeaders;
+      if (varyHeaders !== void 0 && varyHeaders.length > 0) {
+        prep.varyHeaders = varyHeaders.map((h) => h.toLowerCase());
+      }
+      preparedRoutes.set(route2, prep);
+    }
+  };
+  buildPreparedRoutes(routeTable);
   const limiter = new RedisRateLimiter(config.limiter);
-  const apiKeyGuard = config.apiKeys ? new ApiKeyGuard(config.apiKeys) : void 0;
-  const authProviders = [
-    ...config.auth?.providers ?? [],
-    ...config.auth?.jwt !== void 0 ? [createJwtProvider(config.auth.jwt)] : []
-  ];
   const securityStore = config.limiter?.redis ?? new InMemoryRedis();
   const bruteForceGuard = config.bruteForce ? new BruteForceGuard(securityStore, config.bruteForce) : void 0;
   const maxBodyBytes = config.maxBodyBytes ?? DEFAULTS.perimeter.maxBodyBytes;
   const plugins = config.plugins ?? [];
+  const loadBalancer = new LoadBalancer();
+  const shedder = config.loadShedding?.enabled === true ? new LoadShedder({
+    ...config.loadShedding.maxEventLoopDelayMs !== void 0 ? { maxEventLoopDelayMs: config.loadShedding.maxEventLoopDelayMs } : {},
+    ...config.loadShedding.maxConcurrentRequests !== void 0 ? { maxConcurrentRequests: config.loadShedding.maxConcurrentRequests } : {}
+  }) : void 0;
+  shedder?.start();
   const emitSecurity = (type, detail, clientIp, path2) => {
     if (!config.onSecurityEvent) return;
     const event = {
@@ -1629,17 +2790,27 @@ function createGateway(config) {
     } catch {
     }
   };
+  const nodeId = (0, import_node_crypto6.randomUUID)();
+  const distributedStore = securityStore;
+  const idempotencyManager = new IdempotencyManager(distributedStore, nodeId);
+  const coalescer = new RequestCoalescer(distributedStore, { nodeId });
   const circuitBreaker = new CircuitBreaker();
+  circuitBreaker.setDistributedStore(distributedStore, nodeId);
   const proxy = new ProxyHandler({
     timeoutMs: config.upstreamTimeoutMs ?? DEFAULTS.proxy.upstreamTimeoutMs,
-    maxSockets: config.maxSockets ?? DEFAULTS.proxy.maxSockets
+    maxSockets: config.maxSocketsPerUpstream ?? config.maxSockets ?? DEFAULTS.proxy.maxSockets
   });
   const startedAt = Date.now();
   const caches = /* @__PURE__ */ new WeakMap();
   const cacheFor = (route2, cfg) => {
     let cache = caches.get(route2);
     if (!cache) {
-      cache = new ResponseCache(cfg.ttlMs, cfg.maxEntries ?? DEFAULTS.cache.maxEntries);
+      cache = new ResponseCache(
+        cfg.ttlMs,
+        cfg.maxEntries ?? DEFAULTS.cache.maxEntries,
+        Date.now,
+        distributedStore
+      );
       caches.set(route2, cache);
     }
     return cache;
@@ -1649,15 +2820,17 @@ function createGateway(config) {
   let activeRequests = 0;
   let drainNotify;
   const activeResponses = /* @__PURE__ */ new Set();
+  const activeTunnels = /* @__PURE__ */ new Set();
   function notifyDrained() {
     if (activeRequests === 0) drainNotify?.();
   }
   async function handleRequest(req, res) {
     if (draining) {
-      sendJson(
+      sendErrorJson(
         res,
         STATUS.serviceUnavailable,
-        defaultErrorBody(ERROR_CODES.draining, "server is draining"),
+        ERROR_CODES.draining,
+        "server is draining",
         {
           [HEADERS.connection]: "close",
           [HEADERS.retryAfter]: String(DEFAULTS.shutdown.retryAfterSeconds)
@@ -1665,30 +2838,47 @@ function createGateway(config) {
       );
       return;
     }
+    if (shedder?.shouldShed()) {
+      sendErrorJson(
+        res,
+        STATUS.serviceUnavailable,
+        ERROR_CODES.overloaded,
+        "gateway overloaded",
+        {
+          [HEADERS.retryAfter]: String(DEFAULTS.networking.shedRetryAfterSec)
+        }
+      );
+      return;
+    }
     activeRequests += 1;
+    shedder?.enter();
     activeResponses.add(res);
     res.on("close", () => activeResponses.delete(res));
     try {
       await pipeline(req, res);
     } catch (err) {
       if (!res.headersSent && !res.writableEnded) {
-        sendJson(res, STATUS.badGateway, defaultErrorBody(
+        sendErrorJson(
+          res,
+          STATUS.badGateway,
           ERROR_CODES.upstreamError,
           err instanceof Error ? err.message : "internal error"
-        ));
+        );
       } else {
         res.destroy();
       }
     } finally {
       activeRequests -= 1;
+      shedder?.leave();
       activeResponses.delete(res);
       notifyDrained();
     }
   }
-  function replayCache(res, entry, status) {
+  function replayCache(res, entry, status, extraHeaders) {
     res.writeHead(entry.statusCode, {
       ...entry.headers,
-      [HEADERS.gatewayCache]: status
+      [HEADERS.gatewayCache]: status,
+      ...extraHeaders
     });
     res.end(entry.body);
   }
@@ -1701,11 +2891,16 @@ function createGateway(config) {
   async function handleReadiness(res) {
     const timeoutMs = config.probes?.readinessTimeoutMs ?? DEFAULTS.probes.readinessTimeoutMs;
     const redisOk = await limiter.ping(timeoutMs);
-    const circuitsOk = routes.every(
-      (route2) => route2.upstreams.some(
-        (u) => circuitBreaker.stateOf(`${route2.prefix}|${u.url}`) !== CIRCUIT_STATES.open
-      )
-    );
+    let circuitsOk = true;
+    for (const route2 of routeTable) {
+      for (const u of route2.upstreams) {
+        if (await circuitBreaker.stateOfShared(`${route2.prefix}|${u.url}`) === CIRCUIT_STATES.open) {
+          circuitsOk = false;
+          break;
+        }
+      }
+      if (!circuitsOk) break;
+    }
     const ready = redisOk && circuitsOk;
     sendJson(
       res,
@@ -1752,10 +2947,13 @@ function createGateway(config) {
     }
   }
   async function pipeline(req, res) {
-    const started = import_node_perf_hooks.performance.now();
+    const started = import_node_perf_hooks2.performance.now();
     const ctx = await pipelineInner(req, res);
+    if (ctx) {
+      metrics.recordRequest(ctx.route.prefix, import_node_perf_hooks2.performance.now() - started);
+    }
     if (ctx && plugins.length > 0) {
-      const durationMs = import_node_perf_hooks.performance.now() - started;
+      const durationMs = import_node_perf_hooks2.performance.now() - started;
       for (const plugin of plugins) {
         try {
           await plugin.onResponse?.({ ...ctx, durationMs }, res.statusCode, durationMs);
@@ -1769,10 +2967,7 @@ function createGateway(config) {
     const clientIp = extractClientIp(req);
     if (isPathTraversal(pathname)) {
       emitSecurity(SECURITY_EVENT_TYPES.pathTraversalBlocked, pathname, clientIp, pathname);
-      sendJson(res, 400, defaultErrorBody(
-        ERROR_CODES.pathTraversalBlocked,
-        "malformed request path"
-      ));
+      sendErrorJson(res, 400, ERROR_CODES.pathTraversalBlocked, "malformed request path");
       return void 0;
     }
     applyPerimeterHeaders(req, res);
@@ -1785,10 +2980,11 @@ function createGateway(config) {
           clientIp,
           pathname
         );
-        sendJson(
+        sendErrorJson(
           res,
           STATUS.locked,
-          defaultErrorBody(ERROR_CODES.locked, "too many failed authentication attempts"),
+          ERROR_CODES.locked,
+          "too many failed authentication attempts",
           { [HEADERS.retryAfter]: String(lockedSecs) }
         );
         return void 0;
@@ -1813,78 +3009,62 @@ function createGateway(config) {
     }
     const resolved = router.resolve(req);
     if (!resolved) {
-      sendJson(res, 404, defaultErrorBody(ERROR_CODES.noRoute, "no matching route"));
+      sendErrorJson(res, 404, ERROR_CODES.noRoute, "no matching route");
       return void 0;
     }
     const { route: route2, strippedPath } = resolved;
-    if (route2.allowedContentTypes && !contentTypeAllowed(req, route2.allowedContentTypes)) {
-      sendJson(res, STATUS.unsupportedMediaType, defaultErrorBody(
+    const prep = preparedRoutes.get(route2);
+    if (prep?.contentTypes !== void 0 && !contentTypeAllowed(req, prep.contentTypes)) {
+      sendErrorJson(
+        res,
+        STATUS.unsupportedMediaType,
         ERROR_CODES.unsupportedMediaType,
         "unsupported content type"
-      ));
+      );
       return void 0;
     }
-    const denyAuth = async (statusCode, code, message, extraHeaders) => {
+    const denyGuard = async (statusCode, code, message, extraHeaders) => {
       if (bruteForceGuard) await bruteForceGuard.recordFailure(clientIp);
       emitSecurity(SECURITY_EVENT_TYPES.authDenied, message, clientIp, pathname);
-      sendJson(res, statusCode, defaultErrorBody(code, message), extraHeaders);
+      sendErrorJson(res, statusCode, code, message, extraHeaders);
       return void 0;
     };
-    let identity;
-    if (authProviders.length > 0 && authRequired(route2)) {
-      let deniedReason;
-      for (const provider of authProviders) {
-        const outcome = await provider.authenticate(req);
-        if ("authenticated" in outcome) {
-          if (outcome.authenticated) {
-            identity = outcome.identity;
-            break;
-          }
-          deniedReason = outcome.reason ?? "authentication failed";
-          break;
-        }
-      }
-      if (identity === void 0) {
-        const realm = config.auth?.realm;
-        return denyAuth(
-          STATUS.unauthorized,
-          ERROR_CODES.unauthorized,
-          deniedReason ?? "authentication required",
-          {
-            [HEADERS.wwwAuthenticate]: realm ? `Bearer realm="${realm}"` : "Bearer"
-          }
-        );
-      }
-      const verified = identity;
-      if (Array.isArray(route2.auth) && route2.auth.length > 0) {
-        const allowed = route2.auth.some((role) => verified.roles.includes(role));
-        if (!allowed) {
-          return denyAuth(
-            STATUS.forbidden,
-            ERROR_CODES.forbidden,
-            "insufficient role"
-          );
-        }
-      }
-      if (bruteForceGuard) await bruteForceGuard.recordSuccess(clientIp);
-    }
-    let apiKeyRecord;
-    if (apiKeyGuard && route2.requiredScopes !== void 0) {
-      const result = await apiKeyGuard.authenticate(req, route2);
-      if (!result.ok) {
-        const status = result.reason === "forbidden" ? STATUS.forbidden : STATUS.unauthorized;
-        const code = result.reason === "forbidden" ? ERROR_CODES.forbidden : ERROR_CODES.apiKeyInvalid;
-        if (bruteForceGuard) await bruteForceGuard.recordFailure(clientIp);
-        emitSecurity(SECURITY_EVENT_TYPES.apiKeyDenied, result.reason, clientIp, pathname);
-        sendJson(res, status, defaultErrorBody(code, `api key ${result.reason}`));
-        return void 0;
-      }
-      apiKeyRecord = result.record;
-      if (bruteForceGuard) await bruteForceGuard.recordSuccess(clientIp);
-    }
     const extractor = resolveExtractor(route2, extractKey);
     const clientKey = await extractor(req);
-    const upstream = router.nextUpstream(route2.prefix, route2.upstreams);
+    const guardHeaders = {};
+    const guardTags = {};
+    const prepStrip = prep?.stripHeaders;
+    const allGuards = [...config.guards ?? [], ...route2.guards ?? []];
+    if (allGuards.length > 0) {
+      const edgeCtx = {
+        req,
+        method: req.method ?? "GET",
+        path: pathname,
+        url: req.url,
+        routePrefix: String(route2.prefix),
+        clientKey,
+        clientIp,
+        tags: guardTags,
+        headers: guardHeaders
+      };
+      for (const guard of allGuards) {
+        const decision = await guard.evaluate(edgeCtx);
+        if (decision.action === "deny") {
+          return denyGuard(
+            decision.status,
+            decision.code,
+            decision.message,
+            decision.headers
+          );
+        }
+        if (decision.headers) Object.assign(guardHeaders, decision.headers);
+        if (decision.tags) Object.assign(guardTags, decision.tags);
+      }
+      if (bruteForceGuard) await bruteForceGuard.recordSuccess(clientIp);
+    }
+    const hasGuardContext = Object.keys(guardTags).length > 0 || Object.keys(guardHeaders).length > 0;
+    const strategy = route2.upstreamStrategy ?? (route2.upstreams.length > 1 ? "p2c" : "weighted-rr");
+    const upstream = strategy === "p2c" ? loadBalancer.selectP2C(route2.upstreams) : router.nextUpstream(route2.prefix, route2.upstreams);
     const queryIndex = req.url?.indexOf("?") ?? -1;
     const query = queryIndex === -1 ? "" : req.url.slice(queryIndex);
     const forwardPathname = route2.stripPrefix === false ? pathname : strippedPath;
@@ -1895,9 +3075,9 @@ function createGateway(config) {
       route: route2,
       upstream,
       clientKey,
+      tags: guardTags,
       upstreamPath: forwardPathname,
-      upstreamUrl: `${upstream.url}${path2}`,
-      ...identity !== void 0 ? { identity } : {}
+      upstreamUrl: `${upstream.url}${path2}`
     };
     for (const plugin of plugins) {
       const decision = await plugin.onRequest?.(ctx);
@@ -1908,13 +3088,11 @@ function createGateway(config) {
           clientIp,
           pathname
         );
-        sendJson(
+        sendErrorJson(
           res,
           decision.statusCode ?? STATUS.forbidden,
-          defaultErrorBody(
-            decision.code ?? ERROR_CODES.policyDenied,
-            decision.message ?? "request denied by policy"
-          )
+          decision.code ?? ERROR_CODES.policyDenied,
+          decision.message ?? "request denied by policy"
         );
         return ctx;
       }
@@ -1924,7 +3102,7 @@ function createGateway(config) {
       sendGatewayResponse(res, early);
       return ctx;
     }
-    const effectiveRateLimit = apiKeyRecord?.rateLimitOverride ?? route2.rateLimit;
+    const effectiveRateLimit = route2.rateLimit;
     let rateHeaders;
     if (effectiveRateLimit) {
       const result = await limiter.consume(
@@ -1934,13 +3112,17 @@ function createGateway(config) {
       rateHeaders = {
         [HEADERS.rateLimitLimit]: String(result.limit),
         [HEADERS.rateLimitRemaining]: String(result.remaining),
-        [HEADERS.rateLimitReset]: String(result.resetAt)
+        [HEADERS.rateLimitReset]: String(result.resetAt),
+        ...result.source !== void 0 ? { [HEADERS.rateLimitSource]: result.source } : {}
       };
       if (!result.allowed) {
-        sendJson(
+        metrics.recordOutcome(route2.prefix, "rate_limited");
+        await config.hooks?.onRateLimited?.(ctx, result);
+        sendErrorJson(
           res,
           STATUS.tooManyRequests,
-          defaultErrorBody(ERROR_CODES.rateLimited, "rate limit exceeded"),
+          ERROR_CODES.rateLimited,
+          "rate limit exceeded",
           {
             ...rateHeaders,
             [HEADERS.retryAfter]: String(secondsUntil(result.resetAt, Date.now()))
@@ -1954,34 +3136,128 @@ function createGateway(config) {
       sendGatewayResponse(res, { ...authorized, headers: { ...rateHeaders, ...authorized.headers } });
       return ctx;
     }
+    if (metricsPathKey !== void 0 && pathname === metricsPathKey) {
+      const accept = getHeaderString(req, "accept") ?? "";
+      if (accept.includes("application/json")) {
+        sendJson(res, STATUS.ok, metrics.snapshot());
+      } else {
+        const body = metrics.prometheus();
+        res.writeHead(STATUS.ok, {
+          "content-type": "text/plain; version=0.0.4; charset=utf-8",
+          "content-length": String(Buffer.byteLength(body))
+        });
+        res.end(body);
+      }
+      return ctx;
+    }
+    const method = req.method ?? "GET";
+    const idemCfg = route2.idempotency;
+    const idemKey = getHeaderString(req, HEADERS.idempotencyKey);
+    const idemApplies = idemCfg?.enabled === true && idemKey !== null && (idemCfg.methods ?? DEFAULTS.resilience.idempotencyMethods).includes(method);
+    let idemBody;
+    let idemComplete;
+    let idemAbort;
+    if (idemApplies && idemKey) {
+      try {
+        idemBody = await readRequestBody(req, maxBodyBytes);
+      } catch {
+        sendErrorJson(
+          res,
+          STATUS.payloadTooLarge,
+          ERROR_CODES.payloadTooLarge,
+          "request body too large",
+          rateHeaders
+        );
+        return ctx;
+      }
+      const tagScope = Object.keys(guardTags).sort().map((k) => `${k}=${guardTags[k] ?? ""}`).join("&");
+      const scope = `${clientKey}|${String(route2.prefix)}|${tagScope}`;
+      const fingerprint = idempotencyManager.fingerprint(method, req.url ?? pathname, idemBody);
+      const begin = await idempotencyManager.begin(scope, idemKey, fingerprint, {
+        ttlMs: idemCfg?.ttlMs ?? DEFAULTS.resilience.idempotencyTtlMs,
+        lockTimeoutMs: idemCfg?.lockTimeoutMs ?? DEFAULTS.resilience.idempotencyLockTimeoutMs
+      });
+      if (begin.action === "replay") {
+        res.writeHead(begin.statusCode, {
+          ...begin.headers,
+          [HEADERS.idempotentReplay]: "true"
+        });
+        res.end(begin.body);
+        return ctx;
+      }
+      if (begin.action === "conflict") {
+        sendErrorJson(
+          res,
+          STATUS.conflict,
+          ERROR_CODES.conflict,
+          "request with this Idempotency-Key is still in progress",
+          { ...rateHeaders, [HEADERS.retryAfter]: "1" }
+        );
+        return ctx;
+      }
+      if (begin.action === "fingerprint-mismatch") {
+        sendErrorJson(
+          res,
+          STATUS.unprocessableEntity,
+          ERROR_CODES.idempotencyMismatch,
+          "Idempotency-Key was already used with a different request payload",
+          rateHeaders
+        );
+        return ctx;
+      }
+      idemComplete = begin.complete;
+      idemAbort = begin.abort;
+    }
     const breakerKey = `${route2.prefix}|${upstream.url}`;
     if (route2.circuitBreaker) {
       circuitBreaker.configure(breakerKey, route2.circuitBreaker);
     }
-    const method = req.method ?? "GET";
     const cacheCfg = route2.cache;
     const cacheable = cacheCfg !== void 0 && (method === "GET" || method === "HEAD");
-    const useCache = cacheable && !requestForbidsCache(req) && (identity === void 0 || cacheCfg?.allowAuthenticated === true);
+    const useCache = cacheable && !requestForbidsCache(req) && (!hasGuardContext || cacheCfg?.allowContextual === true);
     let cache;
     let cacheKey;
     if (useCache && cacheCfg) {
       cache = cacheFor(route2, cacheCfg);
-      cacheKey = `${method} ${ctx.upstreamUrl}`;
-      const { fresh, stale } = cache.lookup(cacheKey);
+      let keySuffix = "";
+      for (const tagKey of cacheCfg.varyTags ?? []) {
+        const v = guardTags[tagKey];
+        if (v !== void 0) keySuffix += `|t:${tagKey}=${v}`;
+      }
+      for (const headerName of prep?.varyHeaders ?? []) {
+        const raw = req.headers[headerName];
+        const v = Array.isArray(raw) ? raw[0] : raw;
+        if (v !== void 0) keySuffix += `|h:${headerName}=${v}`;
+      }
+      if (cacheCfg.allowContextual === true) {
+        for (const k of Object.keys(guardTags).sort()) {
+          keySuffix += `|t:${k}=${guardTags[k] ?? ""}`;
+        }
+        for (const k of Object.keys(guardHeaders).sort()) {
+          keySuffix += `|g:${k}=${guardHeaders[k] ?? ""}`;
+        }
+      }
+      cacheKey = `${method} ${ctx.upstreamUrl}${keySuffix}`;
+      const { fresh, stale } = await cache.lookupShared(cacheKey);
       if (fresh) {
+        metrics.recordOutcome(route2.prefix, "cache_hit");
         replayCache(res, fresh, CACHE_STATUS.hit);
         return ctx;
       }
-      if (stale && cacheCfg.serveStaleOnCircuitOpen && circuitBreaker.stateOf(breakerKey) === CIRCUIT_STATES.open) {
+      if (stale && cacheCfg.serveStaleOnCircuitOpen && await circuitBreaker.stateOfShared(breakerKey) === CIRCUIT_STATES.open) {
+        metrics.recordOutcome(route2.prefix, "cache_hit");
         replayCache(res, stale, CACHE_STATUS.stale);
         return ctx;
       }
     }
-    if (!circuitBreaker.canExecute(breakerKey)) {
-      sendJson(
+    if (!await circuitBreaker.canExecuteShared(breakerKey)) {
+      metrics.recordOutcome(route2.prefix, "circuit_open");
+      await config.hooks?.onCircuitOpen?.(ctx);
+      sendErrorJson(
         res,
         STATUS.serviceUnavailable,
-        defaultErrorBody(ERROR_CODES.circuitOpen, "upstream circuit is open"),
+        ERROR_CODES.circuitOpen,
+        "upstream circuit is open",
         rateHeaders
       );
       return ctx;
@@ -1990,81 +3266,327 @@ function createGateway(config) {
       ...rateHeaders,
       ...cacheable ? { [HEADERS.gatewayCache]: CACHE_STATUS.miss } : {}
     };
-    try {
-      const info = await proxy.forward(
-        req,
-        res,
-        {
-          upstream,
-          path: path2,
-          responseHeaders: Object.keys(responseHeaders).length ? responseHeaders : void 0,
-          identityHeaders: identityToHeaders(identity),
-          stripHeaders: config.auth?.stripHeaders,
-          ...config.upstreamSigning !== void 0 ? {
-            signing: {
-              secret: config.upstreamSigning.secret,
-              userId: identity?.userId ?? "",
-              ...config.upstreamSigning.headerName !== void 0 ? { headerName: config.upstreamSigning.headerName } : {},
-              ...config.upstreamSigning.timestampHeader !== void 0 ? { timestampHeader: config.upstreamSigning.timestampHeader } : {}
-            }
-          } : {}
-        },
-        {
-          captureBody: useCache,
-          maxBodyBytes,
-          maskErrors: config.maskUpstreamErrors === true
+    const hedgeCfg = route2.hedging;
+    const hedgeIdempotent = method === "GET" || method === "HEAD" || method === "OPTIONS" || getHeaderString(req, HEADERS.idempotencyKey) !== null;
+    const hedgeApplies = hedgeCfg?.enabled === true && hedgeIdempotent && route2.upstreams.length > 1;
+    const forwardTarget = (u) => ({
+      upstream: u,
+      path: path2,
+      responseHeaders: Object.keys(responseHeaders).length ? responseHeaders : void 0,
+      guardHeaders: Object.keys(guardHeaders).length > 0 ? guardHeaders : void 0,
+      stripHeaders: prepStrip !== void 0 && prepStrip.size > 0 ? prepStrip : void 0,
+      ...idemBody !== void 0 ? { bodyOverride: idemBody } : {},
+      ...config.upstreamSigning !== void 0 ? {
+        signing: {
+          secret: config.upstreamSigning.secret,
+          subject: config.upstreamSigning.subjectTag !== void 0 ? guardTags[config.upstreamSigning.subjectTag] ?? "" : "",
+          subjectHeader: config.upstreamSigning.subjectHeader ?? HEADERS.gatewaySubject,
+          ...config.upstreamSigning.headerName !== void 0 ? { headerName: config.upstreamSigning.headerName } : {},
+          ...config.upstreamSigning.timestampHeader !== void 0 ? { timestampHeader: config.upstreamSigning.timestampHeader } : {}
         }
-      );
-      await config.hooks?.onUpstreamResponse?.(ctx, info);
-      if (info.statusCode >= 500) {
-        circuitBreaker.recordFailure(breakerKey);
-      } else {
-        circuitBreaker.recordSuccess(breakerKey);
-      }
-      if (cache && cacheKey && info.statusCode === STATUS.ok && info.body !== void 0 && !responseForbidsCache(info.headers)) {
-        cache.set(cacheKey, {
-          statusCode: info.statusCode,
-          headers: storableHeaders(info.headers),
-          body: info.body
-        });
-      }
-    } catch (err) {
-      circuitBreaker.recordFailure(breakerKey);
-      await config.hooks?.onUpstreamError?.(
-        ctx,
-        err instanceof Error ? err : new Error(String(err))
-      );
-      if (res.headersSent || res.writableEnded) {
-        res.destroy();
-        return ctx;
-      }
-      if (err instanceof PayloadTooLargeError) {
-        sendJson(
+      } : {}
+    });
+    const fetchOnce = async (u, signal) => {
+      const t0 = import_node_perf_hooks2.performance.now();
+      loadBalancer.enter(u.url);
+      try {
+        const info = await proxy.forward(
+          req,
           res,
-          STATUS.payloadTooLarge,
-          defaultErrorBody(ERROR_CODES.payloadTooLarge, "request body too large"),
+          forwardTarget(u),
+          {
+            captureBody: useCache || idemComplete !== void 0,
+            maxBodyBytes,
+            maskErrors: config.maskUpstreamErrors === true,
+            ...signal !== void 0 ? { signal } : {}
+          }
+        );
+        return { info, used: u };
+      } finally {
+        loadBalancer.leave(u.url, import_node_perf_hooks2.performance.now() - t0);
+      }
+    };
+    const fetchUpstream = async () => {
+      if (!hedgeApplies || hedgeCfg === void 0) {
+        return fetchOnce(upstream);
+      }
+      const ac = new AbortController();
+      const maxHedges = hedgeCfg.maxHedges ?? 1;
+      const delayMs = hedgeCfg.delayMs;
+      const hedgeTimers = /* @__PURE__ */ new Set();
+      const clearHedgeTimers = () => {
+        for (const t of hedgeTimers) t.clear();
+        hedgeTimers.clear();
+      };
+      const onClientGone = () => {
+        if (!res.writableEnded) {
+          ac.abort();
+          clearHedgeTimers();
+        }
+      };
+      res.once("close", onClientGone);
+      const attempts = [fetchOnce(upstream, ac.signal)];
+      const tried = /* @__PURE__ */ new Set([upstream.url]);
+      for (let i = 0; i < maxHedges; i += 1) {
+        const candidates = route2.upstreams.filter((u) => !tried.has(u.url));
+        if (candidates.length === 0) break;
+        const alt = loadBalancer.selectP2C(candidates);
+        tried.add(alt.url);
+        attempts.push(
+          new Promise((resolve, reject) => {
+            const t = deadlineTimer(delayMs * (i + 1), () => {
+              hedgeTimers.delete(t);
+              if (ac.signal.aborted) {
+                reject(new Error("hedge aborted"));
+                return;
+              }
+              fetchOnce(alt, ac.signal).then(resolve, reject);
+            });
+            hedgeTimers.add(t);
+          })
+        );
+      }
+      try {
+        const winner = await Promise.any(attempts);
+        ac.abort();
+        clearHedgeTimers();
+        return winner;
+      } catch (err) {
+        ac.abort();
+        clearHedgeTimers();
+        if (err instanceof AggregateError && err.errors.length > 0) {
+          throw err.errors[0];
+        }
+        throw err;
+      } finally {
+        res.off("close", onClientGone);
+      }
+    };
+    const performUpstream = async () => {
+      try {
+        const { info, used } = await fetchUpstream();
+        const usedBreakerKey = `${route2.prefix}|${used.url}`;
+        await config.hooks?.onUpstreamResponse?.(ctx, info);
+        if (idemComplete) {
+          if (info.statusCode < 500) {
+            await idemComplete({
+              statusCode: info.statusCode,
+              headers: info.headers,
+              body: info.body ?? Buffer.alloc(0)
+            });
+          } else {
+            await idemAbort?.();
+          }
+        }
+        if (info.statusCode >= 500) {
+          circuitBreaker.recordFailure(usedBreakerKey);
+        } else {
+          circuitBreaker.recordSuccess(usedBreakerKey);
+        }
+        if (cache && cacheKey && info.statusCode === STATUS.ok && info.body !== void 0 && !responseForbidsCache(info.headers)) {
+          const entry = {
+            statusCode: info.statusCode,
+            headers: storableHeaders(info.headers),
+            body: info.body,
+            storedAt: Date.now()
+          };
+          await cache.setShared(cacheKey, entry);
+          return entry;
+        }
+        return void 0;
+      } catch (err) {
+        await idemAbort?.();
+        circuitBreaker.recordFailure(breakerKey);
+        await config.hooks?.onUpstreamError?.(
+          ctx,
+          err instanceof Error ? err : new Error(String(err))
+        );
+        await config.hooks?.onProxyError?.(
+          ctx,
+          err instanceof Error ? err : new Error(String(err))
+        );
+        if (res.headersSent || res.writableEnded) {
+          res.destroy();
+          return void 0;
+        }
+        if (err instanceof PayloadTooLargeError) {
+          sendErrorJson(
+            res,
+            STATUS.payloadTooLarge,
+            ERROR_CODES.payloadTooLarge,
+            "request body too large",
+            rateHeaders
+          );
+          return void 0;
+        }
+        const isTimeout = err instanceof UpstreamTimeoutError;
+        metrics.recordOutcome(route2.prefix, "upstream_error");
+        sendErrorJson(
+          res,
+          isTimeout ? STATUS.gatewayTimeout : STATUS.badGateway,
+          ERROR_CODES.upstreamError,
+          err instanceof Error ? err.message : "upstream error",
           rateHeaders
         );
+        return void 0;
+      }
+    };
+    const coalesceKey = useCache && cacheCfg?.coalesce !== false && cacheKey ? cacheKey : void 0;
+    if (coalesceKey !== void 0 && cache !== void 0) {
+      const existing = coalescer.get(coalesceKey);
+      if (existing !== void 0) {
+        const entry = await existing;
+        if (entry) {
+          metrics.recordOutcome(route2.prefix, "cache_hit");
+          replayCache(res, entry, CACHE_STATUS.hit, { [HEADERS.coalesced]: "true" });
+        } else {
+          await performUpstream();
+        }
         return ctx;
       }
-      const isTimeout = err instanceof UpstreamTimeoutError;
-      sendJson(
-        res,
-        isTimeout ? STATUS.gatewayTimeout : STATUS.badGateway,
-        defaultErrorBody(
-          ERROR_CODES.upstreamError,
-          err instanceof Error ? err.message : "upstream error"
-        ),
-        rateHeaders
-      );
+      const isLeader = await coalescer.acquireLease(coalesceKey);
+      if (!isLeader) {
+        const shared = await coalescer.waitForShared(
+          coalesceKey,
+          () => cache.lookupL2(coalesceKey)
+        );
+        if (shared) {
+          metrics.recordOutcome(route2.prefix, "cache_hit");
+          replayCache(res, shared, CACHE_STATUS.hit, { [HEADERS.coalesced]: "true" });
+          return ctx;
+        }
+      }
+      const promise = performUpstream();
+      coalescer.set(coalesceKey, promise);
+      try {
+        await promise;
+      } finally {
+        coalescer.delete(coalesceKey);
+        await coalescer.releaseLease(coalesceKey);
+      }
+      return ctx;
     }
+    await performUpstream();
     return ctx;
   }
-  const server = import_node_http2.default.createServer((req, res) => {
+  const server = import_node_http3.default.createServer((req, res) => {
     void handleRequest(req, res);
   });
+  server.on("connection", (socket) => {
+    socket.setNoDelay(true);
+  });
+  server.keepAliveTimeout = DEFAULTS.networking.serverKeepAliveTimeoutMs;
+  server.headersTimeout = DEFAULTS.networking.serverHeadersTimeoutMs;
+  server.requestTimeout = DEFAULTS.networking.serverRequestTimeoutMs;
+  const denyUpgrade = (socket, status, reason, code, message) => {
+    const body = JSON.stringify(defaultErrorBody(code, message));
+    socket.write(
+      `HTTP/1.1 ${status} ${reason}\r
+content-type: application/json\r
+content-length: ${Buffer.byteLength(body)}\r
+connection: close\r
+\r
+` + body
+    );
+    socket.destroy();
+  };
+  async function handleUpgrade(req, socket, head) {
+    try {
+      if (draining) {
+        denyUpgrade(socket, 503, "Service Unavailable", ERROR_CODES.draining, "server is draining");
+        return;
+      }
+      const upgradeReq = req;
+      const resolved = router.resolve(upgradeReq);
+      if (!resolved) {
+        denyUpgrade(socket, 404, "Not Found", ERROR_CODES.noRoute, "no matching route");
+        return;
+      }
+      const { route: route2, strippedPath } = resolved;
+      const extractor = resolveExtractor(route2, extractKey);
+      const clientKey = await extractor(upgradeReq);
+      const clientIp = socket.remoteAddress ?? "";
+      const guardHeaders = {};
+      const guardTags = {};
+      const prepStrip = preparedRoutes.get(route2)?.stripHeaders;
+      const allGuards = [...config.guards ?? [], ...route2.guards ?? []];
+      if (allGuards.length > 0) {
+        const edgeCtx = {
+          req: upgradeReq,
+          method: req.method ?? "GET",
+          path: pathnameOf(req.url),
+          url: req.url,
+          routePrefix: String(route2.prefix),
+          clientKey,
+          clientIp,
+          tags: guardTags,
+          headers: guardHeaders
+        };
+        for (const guard of allGuards) {
+          const decision = await guard.evaluate(edgeCtx);
+          if (decision.action === "deny") {
+            const reason = decision.status === 401 ? "Unauthorized" : decision.status === 403 ? "Forbidden" : decision.status === 429 ? "Too Many Requests" : "Denied";
+            denyUpgrade(socket, decision.status, reason, decision.code, decision.message);
+            return;
+          }
+          if (decision.headers) Object.assign(guardHeaders, decision.headers);
+          if (decision.tags) Object.assign(guardTags, decision.tags);
+        }
+      }
+      if (route2.rateLimit) {
+        const result = await limiter.consume(`${route2.prefix}:${clientKey}`, route2.rateLimit);
+        if (!result.allowed) {
+          denyUpgrade(
+            socket,
+            429,
+            "Too Many Requests",
+            ERROR_CODES.rateLimited,
+            "rate limit exceeded"
+          );
+          return;
+        }
+      }
+      const queryIndex = req.url?.indexOf("?") ?? -1;
+      const query = queryIndex === -1 ? "" : req.url.slice(queryIndex);
+      const pathname = pathnameOf(req.url);
+      const forwardPathname = route2.stripPrefix === false ? pathname : strippedPath;
+      const upstream = (route2.upstreamStrategy ?? (route2.upstreams.length > 1 ? "p2c" : "weighted-rr")) === "p2c" ? loadBalancer.selectP2C(route2.upstreams) : router.nextUpstream(route2.prefix, route2.upstreams);
+      loadBalancer.enter(upstream.url);
+      try {
+        proxyUpgrade(req, socket, head, upstream, {
+          path: `${forwardPathname}${query}`,
+          guardHeaders: Object.keys(guardHeaders).length > 0 ? guardHeaders : void 0,
+          stripHeaders: prepStrip !== void 0 && prepStrip.size > 0 ? prepStrip : void 0,
+          ...config.upgradeHandshakeTimeoutMs !== void 0 ? { handshakeTimeoutMs: config.upgradeHandshakeTimeoutMs } : {}
+        });
+      } finally {
+        loadBalancer.leave(upstream.url, 0);
+      }
+    } catch {
+      socket.destroy();
+    }
+  }
+  server.on("upgrade", (req, socket, head) => {
+    activeTunnels.add(socket);
+    socket.once("close", () => activeTunnels.delete(socket));
+    void handleUpgrade(req, socket, head);
+  });
+  function listen(port = config.port ?? DEFAULTS.port, host = config.host ?? DEFAULTS.host) {
+    return new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+  }
   async function shutdown(options) {
     draining = true;
+    shedder?.stop();
+    for (const tunnel of activeTunnels) {
+      destroySafely(tunnel);
+    }
+    activeTunnels.clear();
     for (const res of activeResponses) {
       res.shouldKeepAlive = false;
     }
@@ -2096,17 +3618,80 @@ function createGateway(config) {
   return {
     server,
     handleRequest,
-    router,
+    get router() {
+      return router;
+    },
     limiter,
     circuitBreaker,
-    listen(port = config.port ?? DEFAULTS.port, host = config.host ?? DEFAULTS.host) {
-      return new Promise((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(port, host, () => {
-          server.off("error", reject);
-          resolve();
-        });
+    metrics,
+    reloadRoutes(next) {
+      const normalized = isRouteReloadConfig(next) ? assembleRoutes({
+        routes: next.routes,
+        target: next.target ?? config.target,
+        rateLimit: next.rateLimit ?? config.rateLimit,
+        circuitBreaker: next.circuitBreaker ?? config.circuitBreaker,
+        cache: next.cache ?? config.cache,
+        autoRoutes: next.autoRoutes ?? config.autoRoutes,
+        basePrefix: config.basePrefix
+      }) : assembleRoutes({
+        // Guard returned false → `next` is RoutesInput, not options.
+        routes: next,
+        basePrefix: config.basePrefix
       });
+      if (normalized.length === 0) {
+        throw new Error(
+          "[gateway] reloadRoutes produced an empty route table \u2014 refusing to drop all routes."
+        );
+      }
+      assertNoMetadataUpstreams(
+        normalized.flatMap((r) => r.upstreams.map((u) => u.url)),
+        config.allowMetadataUpstreams === true
+      );
+      routeTable = withMetricsRoute(normalized);
+      router = new Router(routeTable);
+      buildPreparedRoutes(routeTable);
+    },
+    listen,
+    listenCluster(portOrOptions, workerCount) {
+      const options = {
+        ...typeof portOrOptions === "object" ? portOrOptions : {},
+        ...workerCount !== void 0 ? { workers: workerCount } : {}
+      };
+      return listenCluster(
+        { listen, shutdown, close: () => shutdown() },
+        options
+      );
+    },
+    poolMetrics() {
+      const sockets = proxy.poolMetrics();
+      const out = {};
+      const seen = /* @__PURE__ */ new Set();
+      for (const route2 of routeTable) {
+        for (const u of route2.upstreams) {
+          if (seen.has(u.url)) continue;
+          seen.add(u.url);
+          try {
+            const origin = new URL(u.url).origin;
+            const s = sockets[origin] ?? {
+              activeSockets: 0,
+              freeSockets: 0,
+              queuedRequests: 0
+            };
+            out[u.url] = {
+              ...s,
+              inFlight: loadBalancer.statsOf(u.url).inFlight
+            };
+          } catch {
+            out[u.url] = {
+              activeSockets: 0,
+              freeSockets: 0,
+              queuedRequests: 0,
+              inFlight: loadBalancer.statsOf(u.url).inFlight
+            };
+          }
+        }
+      }
+      return out;
     },
     shutdown,
     close() {
@@ -2115,12 +3700,22 @@ function createGateway(config) {
   };
 }
 
+// src/adapters/adapterCore.ts
+function createAdapterGateway(config) {
+  return createGateway({
+    ...config,
+    ...config.routes !== void 0 ? { routes: config.routes } : {}
+  });
+}
+function routeMatches(gateway, req) {
+  return gateway.router.resolve(req) !== void 0;
+}
+
 // src/adapters/fastify.ts
 function registerGateway(fastify, config) {
-  const gateway = createGateway(config);
+  const gateway = createAdapterGateway(config);
   fastify.addHook("onRequest", async (request, reply) => {
-    const matched = gateway.router.resolve(request.raw) !== void 0;
-    if (!matched) return;
+    if (!routeMatches(gateway, request.raw)) return;
     reply.hijack();
     await gateway.handleRequest(request.raw, reply.raw);
   });

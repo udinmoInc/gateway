@@ -5,6 +5,8 @@ export default defineConfig({
     index: 'src/index.ts',
     express: 'src/adapters/express.ts',
     fastify: 'src/adapters/fastify.ts',
+    fetch: 'src/adapters/fetch.ts',
+    cli: 'src/cli.ts',
   },
   format: ['esm', 'cjs'],
   outExtension({ format }) {

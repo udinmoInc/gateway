@@ -25,6 +25,8 @@ function matchesPrefix(pathname: string, prefix: string): boolean {
  */
 export class Router<TReq extends IncomingMessage = IncomingMessage> {
   private readonly routes: RouteConfig<TReq>[];
+  /** O(1) exact-path hits (pathname === prefix) checked before prefix scan. */
+  private readonly exact = new Map<string, RouteConfig<TReq>>();
   private readonly counters = new Map<string, number>();
 
   constructor(routes: readonly RouteConfig<TReq>[]) {
@@ -32,10 +34,20 @@ export class Router<TReq extends IncomingMessage = IncomingMessage> {
     this.routes = [...routes].sort(
       (a, b) => b.prefix.length - a.prefix.length,
     );
+    // Exact-path index: when the request path equals a route prefix
+    // verbatim, skip the O(n) prefix scan entirely.
+    for (const route of this.routes) {
+      const key = String(route.prefix);
+      if (!this.exact.has(key)) this.exact.set(key, route);
+    }
   }
 
   resolve(req: TReq): ResolvedRoute<TReq> | undefined {
     const pathname = pathnameOf(req.url);
+    const exactHit = this.exact.get(pathname);
+    if (exactHit !== undefined) {
+      return { route: exactHit, strippedPath: '/' };
+    }
     for (const route of this.routes) {
       const prefix: string = route.prefix;
       if (matchesPrefix(pathname, prefix)) {
