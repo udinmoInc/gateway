@@ -12,5 +12,37 @@ services:
       timeout: 3s
       retries: 10
 
+  # Demo upstream the gateway proxies to.
+  demo-upstream:
+    image: node:20-alpine
+    working_dir: /app
+    command: >-
+      node -e "require('http').createServer((q,s)=>{s.writeHead(200,{'content-type':'application/json'});s.end(JSON.stringify({ok:true,url:q.url}))}).listen(4000)"
+    expose:
+      - "4000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      demo-upstream:
+        condition: service_started
+    environment:
+      # Distributed limiter across replicas — swap for any ioredis URL.
+      REDIS_URL: redis://redis:6379
+    command: >
+      start --port 8080 --host 0.0.0.0
+      --target http://demo-upstream:4000
+      --limit 600/min
+    restart: unless-stopped
+
 volumes:
   redis-data:
