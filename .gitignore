@@ -1,1 +1,30 @@
+# dependencies
 /node_modules
+
+# build output is committed intentionally for npm pack — keep local noise out anyway
+*.tgz
+*.log
+
+# env & secrets — never commit
+.env
+.env.*
+!.env.example
+
+# test & tooling artifacts
+coverage/
+.nyc_output/
+.vite/
+.vitest/
+test-results/
+*.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# docker
+redis-data/
