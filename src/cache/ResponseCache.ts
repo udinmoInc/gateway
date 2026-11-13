@@ -25,6 +25,17 @@ interface L2Payload {
   storedAt: number;
 }
 
+function isL2Payload(value: unknown): value is L2Payload {
+  if (typeof value !== 'object' || value === null) return false;
+  const p = value as Record<string, unknown>;
+  return (
+    typeof p['statusCode'] === 'number' &&
+    typeof p['storedAt'] === 'number' &&
+    typeof p['body'] === 'string' &&
+    (p['headers'] === undefined || typeof p['headers'] === 'object')
+  );
+}
+
 /**
  * Two-tier response cache: fast in-process L1 LRU plus an optional
  * shared L2 GatewayStore tier so horizontally-scaled nodes share
@@ -75,11 +86,10 @@ export class ResponseCache {
     if (!raw) return local;
     let payload: L2Payload;
     try {
-      payload = JSON.parse(raw) as L2Payload;
+      const parsed: unknown = JSON.parse(raw);
+      if (!isL2Payload(parsed)) return local;
+      payload = parsed;
     } catch {
-      return local;
-    }
-    if (typeof payload.storedAt !== 'number' || typeof payload.body !== 'string') {
       return local;
     }
     const entry: CacheEntry = {
@@ -99,11 +109,10 @@ export class ResponseCache {
     if (!raw) return {};
     let payload: L2Payload;
     try {
-      payload = JSON.parse(raw) as L2Payload;
+      const parsed: unknown = JSON.parse(raw);
+      if (!isL2Payload(parsed)) return {};
+      payload = parsed;
     } catch {
-      return {};
-    }
-    if (typeof payload.storedAt !== 'number' || typeof payload.body !== 'string') {
       return {};
     }
     const entry: CacheEntry = {

@@ -104,7 +104,14 @@ export class CircuitBreaker implements CircuitBreakerLike {
       if (marker !== null) {
         let openedAt = this.now();
         try {
-          openedAt = (JSON.parse(marker) as OpenMarker).openedAt ?? openedAt;
+          const parsed: unknown = JSON.parse(marker);
+          if (
+            typeof parsed === 'object' &&
+            parsed !== null &&
+            typeof (parsed as OpenMarker).openedAt === 'number'
+          ) {
+            openedAt = (parsed as OpenMarker).openedAt;
+          }
         } catch {
           // malformed marker — treat as freshly opened
         }

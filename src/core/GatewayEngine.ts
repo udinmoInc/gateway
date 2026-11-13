@@ -640,8 +640,9 @@ export function createGateway<TReq extends IncomingMessage = IncomingMessage>(
         ? loadBalancer.selectP2C(route.upstreams)
         : router.nextUpstream(route.prefix, route.upstreams);
 
-    const queryIndex = req.url?.indexOf('?') ?? -1;
-    const query = queryIndex === -1 ? '' : req.url!.slice(queryIndex);
+    const url = req.url ?? '';
+    const queryIndex = url.indexOf('?');
+    const query = queryIndex === -1 ? '' : url.slice(queryIndex);
     const forwardPathname = route.stripPrefix === false ? pathname : strippedPath;
     const path = `${forwardPathname}${query}`;
 
@@ -1243,8 +1244,9 @@ export function createGateway<TReq extends IncomingMessage = IncomingMessage>(
         }
       }
 
-      const queryIndex = req.url?.indexOf('?') ?? -1;
-      const query = queryIndex === -1 ? '' : req.url!.slice(queryIndex);
+      const url = req.url ?? '';
+      const queryIndex = url.indexOf('?');
+      const query = queryIndex === -1 ? '' : url.slice(queryIndex);
       const pathname = pathnameOf(req.url);
       const forwardPathname = route.stripPrefix === false ? pathname : strippedPath;
       const upstream =

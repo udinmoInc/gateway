@@ -152,6 +152,10 @@ export interface SecurityAuditEvent {
   detail?: string;
 }
 
+/**
+ * HMAC-SHA256 request signing injected on every proxied upstream call.
+ * Downstreams verify with `verifyGatewaySignature()`.
+ */
 export interface UpstreamSigningConfig {
   secret: string;
   /**
@@ -260,6 +264,11 @@ export interface UpstreamTarget {
   weight?: number;
 }
 
+/**
+ * A normalized, validated route — the internal form produced from every
+ * accepted `RoutesInput` shorthand. `prefix` is branded and guaranteed to
+ * start with `/`; `upstreams` is non-empty.
+ */
 export interface RouteConfig<TReq extends IncomingMessage = IncomingMessage> {
   /** Route prefix, matched longest-first. Must start with '/'. */
   prefix: RoutePrefix;
@@ -391,6 +400,11 @@ export interface RouteReloadConfig<
   autoRoutes?: AutoRoutesConfig;
 }
 
+/**
+ * Lifecycle callbacks fired at fixed points in the request pipeline.
+ * Hooks observe and may short-circuit (return a `GatewayResponse`);
+ * they never mutate routing or upstream selection.
+ */
 export interface GatewayHooks<TReq extends IncomingMessage = IncomingMessage> {
   /** Runs before rate limiting. Return a response object to short-circuit. */
   onRequest?(ctx: RequestContext<TReq>): void | Promise<void> | GatewayResponse;
@@ -628,6 +642,12 @@ export interface GatewayServerOptions<TReq extends IncomingMessage = IncomingMes
   onSecurityEvent?: (event: SecurityAuditEvent) => void;
 }
 
+/**
+ * Top-level gateway configuration. At least one route source is required:
+ * `routes`, `target`, `routesDir`, or `autoRoutes` (a lone `healthPath` /
+ * `metricsPath` / `probes` path also satisfies boot validation).
+ * All fields are optional beyond that; unknown keys are ignored.
+ */
 export interface GatewayConfig<TReq extends IncomingMessage = IncomingMessage>
   extends GatewayServerOptions<TReq> {
   /**

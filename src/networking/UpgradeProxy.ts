@@ -2,12 +2,17 @@ import http from 'node:http';
 import net from 'node:net';
 import tls from 'node:tls';
 import type { IncomingMessage } from 'node:http';
-import { HEADERS, DEFAULTS } from '../constants.js';
-import { sanitizeHeaderValue, hopByHopSet } from '../shared/httpUtils.js';
+import { HEADERS, DEFAULTS, HOP_BY_HOP_HEADERS } from '../constants.js';
+import { sanitizeHeaderValue } from '../shared/httpUtils.js';
 import { deadlineTimer, destroySafely } from '../shared/timers.js';
 import type { UpstreamTarget } from '../types.js';
 
-const HOP_FOR_UPGRADE = hopByHopSet(['host']);
+// Upgrade handshakes MUST forward `connection` and `upgrade` — they are
+// the point of the tunnel. Strip the remaining hop-by-hop headers plus host.
+const HOP_FOR_UPGRADE: ReadonlySet<string> = new Set([
+  ...HOP_BY_HOP_HEADERS.filter((h) => h !== 'connection' && h !== 'upgrade'),
+  'host',
+]);
 
 export interface UpgradeTunnelOptions {
   /** Path (with query) to request upstream — same as HTTP proxying. */
